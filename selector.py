@@ -691,6 +691,10 @@ class SelectorEngine:
         self.attr_read_lines: Dict[str, Dict[str, List[int]]] = maps.get("attr_read_lines", {})
         self.attr_import_test_files: Dict[str, List[str]] = maps.get("attr_import_test_files", {})
         self.metaclass_attrs: Set[str] = set(maps.get("metaclass_attrs", ()))
+        self.raw_once_lines: Dict[str, List[int]] = maps.get("once_lines", {})
+        self.path_mentions: Dict[str, List[str]] = maps.get("path_mentions", {})
+        self.lazy_test_importers: Dict[str, List[str]] = maps.get("lazy_test_importers", {})
+        self._once_cache: Dict[str, frozenset] = {}
 
         # Precompute module -> union of class_usage masks cleanly in O(N).
         self.mod_class_mask: Dict[str, int] = defaultdict(int)
@@ -928,6 +932,29 @@ class SelectorEngine:
     def _cls_key(self, rel_path: str, cls_stack: List[str]) -> str:
         return f"{rel_path}::{'.'.join(cls_stack)}"
 
+    def _once_escalation(self, rel_path: str, old_mod: Optional[ast.Module]) -> Tuple[int, int]:
+        """Module-wide users + static importers + tests reaching the module through lazy imports."""
+        b, l = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+        for tf in self.lazy_test_importers.get(rel_path, ()):
+            l |= self.file_to_livemask.get(tf, 0)
+        return b, l
+
+    def _touches_once_lines(self, rel_path: str, lines: Sequence[int], fn_root: Optional[ast.AST]) -> bool:
+        """True if any changed line inside fn_root's *body* only ever runs once per process."""
+        once = self._once_cache.get(rel_path)
+        if once is None:
+            once = frozenset(self.raw_once_lines.get(rel_path, ()))
+            self._once_cache[rel_path] = once
+        if not once:
+            return False
+        lo = 0
+        if isinstance(fn_root, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn_root.body:
+            first = fn_root.body[0]
+            if _is_docstring_stmt(first) and len(fn_root.body) > 1:
+                first = fn_root.body[1]
+            lo = first.lineno  # def / decorator / default-arg lines are import-time by nature: ignore
+        return any(ln >= lo and ln in once for ln in lines)
+
     def _lines_with_fallback(
         self,
         rel_path: str,
@@ -936,6 +963,12 @@ class SelectorEngine:
         old_fn_root: ast.stmt,
         old_mod: Optional[ast.Module],
     ) -> Tuple[int, int]:
+        lines = list(lines)
+        if self._touches_once_lines(rel_path, lines, old_fn_root):
+            # Once-per-process code (metaclass / __init_subclass__ hooks, factory outer bodies, memoized
+            # builders): per-test coverage only credits the first test that triggered it.
+            b, l = self._once_escalation(rel_path, old_mod)
+            return b | self._lines_cov(rel_path, lines), l
         m = self._lines_cov(rel_path, lines)
         if m:
             return m, 0
@@ -1198,7 +1231,11 @@ class SelectorEngine:
                         fn_lines = range(s0, s1 + 1)
                         if _fn_signature_changed(os_, ns_) or _fn_scope_shape(os_) != _fn_scope_shape(ns_):
                             cov = self._lines_cov(rel_path, fn_lines)
-                            if cov:
+                            if cov and self._touches_once_lines(rel_path, fn_lines, os_):
+                                fb, fl = self._once_escalation(rel_path, old_mod)
+                                base |= cov | fb
+                                live |= fl
+                            elif cov:
                                 base |= cov
                             elif cls_stack:
                                 cm = self._class_usage(self._cls_key(rel_path, cls_stack))
@@ -1562,6 +1599,17 @@ class SelectorEngine:
             if not rel_path:
                 continue
 
+            if not rel_path.startswith(("sqlglot/", "tests/")):
+                # Repo files outside the measured trees (sqlglotc/setup.py, setup.py, ...): tests that name them.
+                for pth in {rel_path, a_path}:
+                    if not pth:
+                        continue
+                    fname = pth.rsplit("/", 1)[-1]
+                    ext = ("." + fname.rsplit(".", 1)[-1].lower()) if "." in fname else ""
+                    if ext in _INERT_EXTS:
+                        continue
+                    for tf in self.path_mentions.get(pth.split("/", 1)[0], ()):
+                        live_mask |= self.file_to_livemask.get(tf, 0)
             if is_rename and a_path and rel_path != a_path:
                 # Handle old path as deleted and new path as added.
                 if a_path.endswith(".py"):

@@ -18,6 +18,13 @@ Outputs RWX_track/maps/blast_maps.pkl.zlib containing ONLY baseline commit facts
   - attr_read_lines: {attr_name: {rel_path: [lineno_int, ...]}}
   - attr_import_test_files: {attr_name: [test_rel_path, ...]}
   - metaclass_attrs: list[str]
+  - once_lines: {rel_path: [lineno_int, ...]} lines executed once per process (import / class creation /
+    metaclass hooks / memoized builders); per-test coverage under-attributes them (version 3)
+  - lazy_test_importers: {rel_path: [test_rel_path, ...]} reached only via lazy/dynamic imports
+  - path_mentions: {top_level_entry: [test_rel_path, ...]} for files outside sqlglot/ and tests/
+
+Refresh only the probe-derived keys on an existing maps file:
+  python build_maps.py --augment <sqlglot_repo> maps/blast_maps.pkl.zlib [cache_dir]
 """
 from __future__ import annotations
 
@@ -1118,6 +1125,213 @@ def build_static_graphs(
     return direct_out, rev_trans, typing_out, attr_reads_out, attr_tests_out, meta_out
 
 
+def build_lazy_test_importers(repo: pathlib.Path, rev_imports: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """Test files that reach a module ONLY through dynamic/lazy imports.
+
+    A package __init__ with a module-level __getattr__ (PEP 562), or a module calling
+    importlib.import_module(f"pkg.{...}"), loads sibling submodules lazily (sqlglot.dialects resolving
+    `from sqlglot.dialects import Athena`, Dialect._try_load). Static rev_imports misses those edges. Kept as a
+    separate key (used only for once-per-process escalation) so ordinary importer fallbacks stay narrow.
+    """
+    py_files: Dict[str, str] = {}
+    for top in ("sqlglot", "tests"):
+        for p in sorted((repo / top).rglob("*.py")):
+            py_files[p.relative_to(repo).as_posix()] = p.read_text("utf-8", errors="replace")
+    rel_set = set(py_files)
+    lazy_edges: Dict[str, Set[str]] = defaultdict(set)  # sub-module -> lazy loader module
+    for rel, src in py_files.items():
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        lazy_pkgs: Set[str] = set()
+        if rel.endswith("/__init__.py") and any(
+            isinstance(n, ast.FunctionDef) and n.name == "__getattr__" for n in tree.body
+        ):
+            lazy_pkgs.add(rel.rsplit("/", 1)[0])
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, (ast.Attribute, ast.Name))
+                and (node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id) == "import_module"
+                and node.args
+                and isinstance(node.args[0], ast.JoinedStr)
+                and node.args[0].values
+                and isinstance(node.args[0].values[0], ast.Constant)
+                and isinstance(node.args[0].values[0].value, str)
+                and node.args[0].values[0].value.endswith(".")
+            ):
+                lazy_pkgs.add(node.args[0].values[0].value[:-1].replace(".", "/"))
+        for pkg in lazy_pkgs:
+            for sub in rel_set:
+                if sub != rel and sub.startswith(pkg + "/") and sub.count("/") == pkg.count("/") + 1:
+                    lazy_edges[sub].add(rel)
+    out: Dict[str, List[str]] = {}
+    for target in sorted(rel_set):
+        static = set(rev_imports.get(target, ()))
+        frontier = static | {target}
+        extra: Set[str] = set()
+        for mod in frontier:
+            for loader in lazy_edges.get(mod, ()):
+                extra.add(loader)
+                extra.update(rev_imports.get(loader, ()))
+        tests = sorted(x for x in extra - static if x.startswith("tests/"))
+        if tests:
+            out[target] = tests
+    return out
+
+
+_ONCE_PROBE_SCRIPT = r'''
+import importlib, json, os, pkgutil, sys, warnings
+warnings.simplefilter("ignore")
+repo, out = sys.argv[1], sys.argv[2]
+sys.path.insert(0, repo)
+os.chdir(repo)
+import coverage
+cov = coverage.Coverage(data_file=None, source=[os.path.join(repo, "sqlglot")], branch=False)
+cov.start()
+SQLS = [
+    "SELECT a, b + 1 AS c, 'x' AS s, CAST(d AS INT) FROM t AS x JOIN u ON x.a = u.a WHERE c = 1 GROUP BY a ORDER BY b LIMIT 5",
+    "INSERT INTO t (a) VALUES (1)",
+    "CREATE TABLE t (a INT, b VARCHAR(10))",
+    "WITH q AS (SELECT 1 AS a) SELECT SUM(a) OVER (PARTITION BY a) FROM q UNION ALL SELECT 2",
+]
+
+def _round(tag, first):
+    cov.switch_context(tag)
+    import sqlglot
+    from sqlglot import exp
+    from sqlglot.dialects.dialect import Dialect, Dialects
+    if first:
+        for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
+            if info.name == "sqlglot.__main__":
+                continue
+            try:
+                importlib.import_module(info.name)
+            except Exception:
+                pass
+    from sqlglot.optimizer import optimize
+    for d in [""] + [x.value for x in Dialects if x.value]:
+        try:
+            dia = Dialect.get_or_raise(d)
+            dia.tokenizer_class()
+            dia.parser_class()
+            dia.generator_class()
+            for sql in SQLS:
+                try:
+                    for e in dia.parse(sql):
+                        if e is not None:
+                            e.sql(dialect=dia)
+                            e.sql(dialect=dia, pretty=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    try:
+        optimize(sqlglot.parse_one(SQLS[0]), schema={"t": {"a": "INT", "b": "INT", "d": "TEXT"}, "u": {"a": "INT"}})
+    except Exception:
+        pass
+
+_round("r1", True)
+_round("r2", False)
+cov.stop()
+data = cov.get_data()
+res = {}
+for fname in data.measured_files():
+    rel = os.path.relpath(fname, repo).replace(os.sep, "/")
+    if not rel.startswith("sqlglot/"):
+        continue
+    r1, r2 = set(), set()
+    for ln, ctxs in data.contexts_by_lineno(fname).items():
+        if "r1" in ctxs:
+            r1.add(ln)
+        if "r2" in ctxs:
+            r2.add(ln)
+    once = sorted(r1 - r2)
+    if once:
+        res[rel] = once
+with open(out, "w") as f:
+    json.dump(res, f)
+'''
+
+
+def run_once_lines_probe(repo: pathlib.Path, cache_dir: pathlib.Path) -> Dict[str, List[int]]:
+    """Lines executed only ONCE per process (import time, class creation, metaclass / __init_subclass__
+    hooks, factory outer bodies, memoized builders such as generator._build_dispatch).
+
+    Per-test coverage attributes such lines only to whichever test happened to trigger them first, so a
+    line-coverage lookup on them under-selects. Detected by running the same warm-up workload twice in one
+    fresh interpreter: lines seen in round 1 but never in round 2 are once-per-process lines.
+    """
+    import subprocess
+
+    out = cache_dir / "once_lines.json"
+    script = cache_dir / "once_probe.py"
+    script.write_text(_ONCE_PROBE_SCRIPT, encoding="utf-8")
+    env = dict(os.environ)
+    env["SKIP_INTEGRATION"] = "0"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    t0 = time.perf_counter()
+    subprocess.check_call([sys.executable, str(script), str(repo), str(out)], env=env, cwd=str(repo))
+    res = json.loads(out.read_text("utf-8"))
+    print(
+        f"[Pass 4] once-per-process probe: {len(res)} files, {sum(len(v) for v in res.values())} lines "
+        f"in {time.perf_counter() - t0:.1f}s",
+        file=sys.stderr,
+        flush=True,
+    )
+    return {k: [int(x) for x in v] for k, v in res.items()}
+
+
+def build_path_mentions(repo: pathlib.Path) -> Dict[str, List[str]]:
+    """Top-level repo entries outside sqlglot/ & tests/ (e.g. sqlglotc/, setup.py, pyproject.toml) -> test
+    files whose source mentions that name (e.g. tests/test_sqlglotc.py runs sqlglotc/setup.py via runpy,
+    which neither coverage of sqlglot/ nor the open() hooks attribute)."""
+    tops = sorted(
+        p.name
+        for p in repo.iterdir()
+        if p.name not in ("sqlglot", "tests") and not p.name.startswith(".")
+    )
+    texts = {
+        p.relative_to(repo).as_posix(): p.read_text("utf-8", errors="replace")
+        for p in sorted((repo / "tests").rglob("*.py"))
+    }
+    out: Dict[str, List[str]] = {}
+    for top in tops:
+        stem = top.rsplit(".", 1)[0] if "." in top else top
+        needles = {f'"{top}"', f"'{top}'", f"/{top}", f'"{stem}"', f"'{stem}'"}
+        hits = sorted(rel for rel, txt in texts.items() if any(n in txt for n in needles))
+        if hits:
+            out[top] = hits
+    return out
+
+
+def _augment_main() -> None:
+    """Add/refresh static + probe-derived keys on an existing maps file without re-running pass 1/2."""
+    repo = pathlib.Path(sys.argv[2]).resolve()
+    maps_path = pathlib.Path(sys.argv[3]).resolve()
+    cache_dir = pathlib.Path(sys.argv[4] if len(sys.argv) > 4 else "/tmp/rwx_cache").resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    payload = pickle.loads(zlib.decompress(maps_path.read_bytes()))
+    (
+        payload["imports"],
+        payload["rev_imports"],
+        payload["dialect_typing_links"],
+        payload["attr_read_lines"],
+        payload["attr_import_test_files"],
+        payload["metaclass_attrs"],
+    ) = build_static_graphs(repo)
+    payload["lazy_test_importers"] = build_lazy_test_importers(repo, payload["rev_imports"])
+    payload["once_lines"] = run_once_lines_probe(repo, cache_dir)
+    payload["path_mentions"] = build_path_mentions(repo)
+    print(f"[Pass 5] path_mentions: {payload['path_mentions']}", file=sys.stderr, flush=True)
+    payload["version"] = max(int(payload.get("version", 2)), 3)
+    raw_bytes = pickle.dumps(payload, protocol=5)
+    comp_bytes = zlib.compress(raw_bytes, level=9)
+    maps_path.write_bytes(comp_bytes)
+    print(f"[DONE] Augmented {maps_path} ({len(comp_bytes) / 1024:.1f} KiB)", file=sys.stderr, flush=True)
+
+
 def main() -> None:
     import argparse
     import subprocess
@@ -1201,7 +1415,11 @@ def main() -> None:
         "attr_read_lines": attr_read_lines,
         "attr_import_test_files": attr_import_test_files,
         "metaclass_attrs": metaclass_attrs,
+        "once_lines": run_once_lines_probe(repo, cache_dir),
+        "path_mentions": build_path_mentions(repo),
+        "lazy_test_importers": build_lazy_test_importers(repo, rev_imports),
     }
+    payload["version"] = 3
     raw_bytes = pickle.dumps(payload, protocol=5)
     comp_bytes = zlib.compress(raw_bytes, level=1)
     out_path.write_bytes(comp_bytes)
@@ -1248,5 +1466,7 @@ def _main_pass2() -> None:
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "--pass2-only":
         _main_pass2()
+    elif len(sys.argv) >= 2 and sys.argv[1] == "--augment":
+        _augment_main()
     else:
         main()
