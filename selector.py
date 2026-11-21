@@ -8,9 +8,11 @@ import gzip
 import json
 import math
 import os
+import pickle
 import re
 import sys
-from collections import defaultdict
+import zlib
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -22,7 +24,7 @@ if not DEFAULT_SRC.exists():
         DEFAULT_SRC = alt
 SQLGLOT_SRC = Path(os.environ.get("BLAST_SQLGLOT_DIR", str(DEFAULT_SRC)))
 
-DEFAULT_MAPS = Path(__file__).resolve().parent / "maps" / "blast_maps.json.gz"
+DEFAULT_MAPS = Path(__file__).resolve().parent / "maps" / "blast_maps.pkl.zlib"
 MAPS_PATH = Path(os.environ.get("BLAST_MAPS_PATH", str(DEFAULT_MAPS)))
 
 MAX_WORKERS = 8
@@ -60,8 +62,7 @@ _INERT_NAMES = {
 
 
 def _encoding_cookie(text: str) -> Optional[str]:
-    lines = text.splitlines()[:2]
-    for line in lines:
+    for line in text.splitlines()[:2]:
         m = _CODING_RE.match(line.encode("utf-8", errors="ignore"))
         if m:
             return m.group(1).decode("ascii", errors="ignore").lower()
@@ -76,45 +77,180 @@ def _is_docstring_stmt(node: ast.stmt) -> bool:
     )
 
 
-def _node_dump(node: ast.AST) -> str:
-    return ast.dump(node, include_attributes=False)
+def _ast_eq(a: Any, b: Any) -> bool:
+    """Fast structural AST equality without allocating intermediate ast.dump strings."""
+    if a is b:
+        return True
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.AST):
+        fields = a._fields
+        if fields != b._fields:
+            return False
+        for f in fields:
+            va = getattr(a, f, None)
+            vb = getattr(b, f, None)
+            if type(va) is list:
+                if type(vb) is not list or len(va) != len(vb):
+                    return False
+                for xa, xb in zip(va, vb):
+                    if not _ast_eq(xa, xb):
+                        return False
+            elif isinstance(va, ast.AST):
+                if not _ast_eq(va, vb):
+                    return False
+            elif va != vb or type(va) is not type(vb):
+                return False
+        return True
+    if type(a) is list:
+        if len(a) != len(b):
+            return False
+        return all(_ast_eq(x, y) for x, y in zip(a, b))
+    return a == b and type(a) is type(b)
 
 
-def _stmt_sig(node: ast.stmt) -> Tuple[str, str]:
+def _ast_list_eq(xs: Sequence[Any], ys: Sequence[Any]) -> bool:
+    if len(xs) != len(ys):
+        return False
+    for x, y in zip(xs, ys):
+        if not _ast_eq(x, y):
+            return False
+    return True
+
+
+def _stmt_span(node: ast.AST) -> Tuple[int, int]:
+    start = getattr(node, "lineno", 1) or 1
+    decs = getattr(node, "decorator_list", None)
+    if decs:
+        for d in decs:
+            dl = getattr(d, "lineno", None)
+            if dl is not None and dl < start:
+                start = dl
+    end = getattr(node, "end_lineno", None) or start
+    return start, end
+
+
+def _stmt_sig(node: ast.stmt, lines: Optional[List[str]] = None) -> Tuple[str, Any]:
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return ("fn", node.name)
     if isinstance(node, ast.ClassDef):
         return ("cls", node.name)
-    return ("st", _node_dump(node))
+    if lines:
+        s0, s1 = _stmt_span(node)
+        if 1 <= s0 <= s1 <= len(lines):
+            return ("raw", tuple(lines[s0 - 1 : s1]))
+    return ("st", ast.dump(node, include_attributes=False))
+
+
+def _node_same_fast(
+    os_: ast.AST,
+    ns_: ast.AST,
+    old_lines: Optional[List[str]],
+    new_lines: Optional[List[str]],
+) -> bool:
+    if type(os_) is not type(ns_):
+        return False
+    if old_lines and new_lines:
+        o0, o1 = _stmt_span(os_)
+        n0, n1 = _stmt_span(ns_)
+        if (o1 - o0) == (n1 - n0) and 1 <= o0 <= o1 <= len(old_lines) and 1 <= n0 <= n1 <= len(new_lines):
+            if old_lines[o0 - 1 : o1] == new_lines[n0 - 1 : n1]:
+                return True
+    return _ast_eq(os_, ns_)
 
 
 def _fn_signature_changed(old_fn: ast.AST, new_fn: ast.AST) -> bool:
-    """True if function name, decorators, args, returns, or type_params changed."""
+    """True if function kind, name, decorators, args, returns, or type_params changed."""
     if type(old_fn) is not type(new_fn):
         return True
     assert isinstance(old_fn, (ast.FunctionDef, ast.AsyncFunctionDef))
     assert isinstance(new_fn, (ast.FunctionDef, ast.AsyncFunctionDef))
     if old_fn.name != new_fn.name:
         return True
-    if _node_dump(old_fn.args) != _node_dump(new_fn.args):
+    if not _ast_eq(old_fn.args, new_fn.args):
         return True
-    if [_node_dump(d) for d in old_fn.decorator_list] != [_node_dump(d) for d in new_fn.decorator_list]:
+    if not _ast_list_eq(old_fn.decorator_list, new_fn.decorator_list):
         return True
     if (old_fn.returns is None) != (new_fn.returns is None):
         return True
-    if old_fn.returns is not None and new_fn.returns is not None:
-        if _node_dump(old_fn.returns) != _node_dump(new_fn.returns):
-            return True
-    if getattr(old_fn, "type_params", None) != getattr(new_fn, "type_params", None):
-        old_tp = [_node_dump(x) for x in getattr(old_fn, "type_params", [])]
-        new_tp = [_node_dump(x) for x in getattr(new_fn, "type_params", [])]
-        if old_tp != new_tp:
-            return True
+    if old_fn.returns is not None and not _ast_eq(old_fn.returns, new_fn.returns):
+        return True
+    if not _ast_list_eq(getattr(old_fn, "type_params", []), getattr(new_fn, "type_params", [])):
+        return True
     return False
 
 
+def _fn_scope_shape(fn_node: ast.AST) -> Tuple[frozenset[str], bool]:
+    """Collect local variable bindings & generator yield presence in a function scope."""
+    bound: Set[str] = set()
+    has_yield = False
+    stack: List[ast.AST] = list(getattr(fn_node, "body", ()))
+
+    def _collect_target_names(tgt: ast.AST) -> None:
+        if isinstance(tgt, ast.Name):
+            bound.add(tgt.id)
+        elif isinstance(tgt, (ast.Tuple, ast.List)):
+            for elt in tgt.elts:
+                _collect_target_names(elt)
+        elif isinstance(tgt, ast.Starred):
+            _collect_target_names(tgt.value)
+
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(cur, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            # Outer-most generator's first iter runs in enclosing scope; walrus targets bind in enclosing scope.
+            if cur.generators:
+                stack.append(cur.generators[0].iter)
+            comp_stack: List[ast.AST] = []
+            for gen in cur.generators[1:]:
+                comp_stack.append(gen.iter)
+            for gen in cur.generators:
+                comp_stack.extend(gen.ifs)
+            if isinstance(cur, ast.DictComp):
+                comp_stack.extend((cur.key, cur.value))
+            else:
+                comp_stack.append(cur.elt)
+            while comp_stack:
+                cn = comp_stack.pop()
+                if isinstance(cn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    continue
+                if isinstance(cn, ast.NamedExpr):
+                    bound.add(cn.target.id)
+                comp_stack.extend(ast.iter_child_nodes(cn))
+            continue
+        if isinstance(cur, (ast.Yield, ast.YieldFrom)):
+            has_yield = True
+        elif isinstance(cur, ast.Name) and isinstance(cur.ctx, (ast.Store, ast.Del)):
+            bound.add(cur.id)
+        elif isinstance(cur, ast.ExceptHandler):
+            if cur.name:
+                bound.add(cur.name)
+        elif isinstance(cur, (ast.Global, ast.Nonlocal)):
+            bound.update(cur.names)
+        elif isinstance(cur, (ast.Import, ast.ImportFrom)):
+            for alias in cur.names:
+                bound.add(alias.asname or alias.name.split(".", 1)[0])
+        elif isinstance(cur, ast.NamedExpr):
+            bound.add(cur.target.id)
+        elif isinstance(cur, (ast.MatchAs, ast.MatchStar)):
+            if cur.name:
+                bound.add(cur.name)
+        elif isinstance(cur, ast.MatchMapping):
+            if cur.rest:
+                bound.add(cur.rest)
+        elif isinstance(cur, ast.AnnAssign) and cur.simple and isinstance(cur.target, ast.Name):
+            bound.add(cur.target.id)
+        elif isinstance(cur, ast.Delete):
+            for t in cur.targets:
+                _collect_target_names(t)
+        stack.extend(ast.iter_child_nodes(cur))
+
+    return frozenset(bound), has_yield
+
+
 def _header_lines(stmt: ast.stmt) -> range:
-    """Return conservative line range covering the control header / signature of a compound stmt."""
     start = stmt.lineno
     end = start
     if isinstance(stmt, ast.If):
@@ -128,8 +264,6 @@ def _header_lines(stmt: ast.stmt) -> range:
             end = max(getattr(it.context_expr, "end_lineno", start) or start for it in stmt.items)
     elif isinstance(stmt, ast.Match):
         end = getattr(stmt.subject, "end_lineno", start) or start
-    elif isinstance(stmt, ast.Try):
-        end = start
     return range(start, end + 1)
 
 
@@ -138,10 +272,10 @@ def _find_inner_lambdas_only(old_expr: ast.AST, new_expr: ast.AST) -> Optional[L
     if type(old_expr) is not type(new_expr):
         return None
     if isinstance(old_expr, ast.Lambda) and isinstance(new_expr, ast.Lambda):
-        if _node_dump(old_expr.args) == _node_dump(new_expr.args):
+        if _ast_eq(old_expr.args, new_expr.args):
             return [old_expr]
         return None
-    if _node_dump(old_expr) == _node_dump(new_expr):
+    if _ast_eq(old_expr, new_expr):
         return []
     if isinstance(old_expr, ast.Dict) and isinstance(new_expr, ast.Dict):
         if len(old_expr.keys) != len(new_expr.keys):
@@ -150,9 +284,9 @@ def _find_inner_lambdas_only(old_expr: ast.AST, new_expr: ast.AST) -> Optional[L
         for ok, ov, nk, nv in zip(old_expr.keys, old_expr.values, new_expr.keys, new_expr.values):
             if (ok is None) != (nk is None):
                 return None
-            if ok is not None and _node_dump(ok) != _node_dump(nk):  # type: ignore[arg-type]
+            if ok is not None and not _ast_eq(ok, nk):
                 return None
-            if _node_dump(ov) != _node_dump(nv):
+            if not _ast_eq(ov, nv):
                 sub = _find_inner_lambdas_only(ov, nv)
                 if sub is None:
                     return None
@@ -163,20 +297,20 @@ def _find_inner_lambdas_only(old_expr: ast.AST, new_expr: ast.AST) -> Optional[L
             return None
         out = []
         for oe, ne in zip(old_expr.elts, new_expr.elts):
-            if _node_dump(oe) != _node_dump(ne):
+            if not _ast_eq(oe, ne):
                 sub = _find_inner_lambdas_only(oe, ne)
                 if sub is None:
                     return None
                 out.extend(sub)
         return out
     if isinstance(old_expr, ast.Call) and isinstance(new_expr, ast.Call):
-        if _node_dump(old_expr.func) != _node_dump(new_expr.func):
+        if not _ast_eq(old_expr.func, new_expr.func):
             return None
         if len(old_expr.args) != len(new_expr.args) or len(old_expr.keywords) != len(new_expr.keywords):
             return None
         out = []
         for oa, na in zip(old_expr.args, new_expr.args):
-            if _node_dump(oa) != _node_dump(na):
+            if not _ast_eq(oa, na):
                 sub = _find_inner_lambdas_only(oa, na)
                 if sub is None:
                     return None
@@ -184,13 +318,191 @@ def _find_inner_lambdas_only(old_expr: ast.AST, new_expr: ast.AST) -> Optional[L
         for okw, nkw in zip(old_expr.keywords, new_expr.keywords):
             if okw.arg != nkw.arg:
                 return None
-            if _node_dump(okw.value) != _node_dump(nkw.value):
+            if not _ast_eq(okw.value, nkw.value):
                 sub = _find_inner_lambdas_only(okw.value, nkw.value)
                 if sub is None:
                     return None
                 out.extend(sub)
         return out
     return None
+
+
+def _ast_canon_dict_key(node: ast.AST) -> Optional[str]:
+    if isinstance(node, ast.Constant):
+        v = node.value
+        if isinstance(v, str):
+            return f"str:{v}"
+        if isinstance(v, int) and not isinstance(v, bool):
+            return f"int:{v}"
+        return None
+    if isinstance(node, ast.Tuple):
+        parts: List[str] = []
+        for elt in node.elts:
+            ce = _ast_canon_dict_key(elt)
+            if ce is None:
+                return None
+            parts.append(ce)
+        return "tuple:(" + ",".join(parts) + ")"
+    if isinstance(node, ast.Attribute):
+        v = node.value
+        if isinstance(v, ast.Name):
+            if v.id == "exp":
+                return f"cls:{node.attr}"
+            if v.id in ("TokenType", "DType"):
+                return f"enum:{v.id}.{node.attr}"
+        elif isinstance(v, ast.Attribute) and isinstance(v.value, ast.Name):
+            if v.value.id == "exp" and v.attr == "DType":
+                return f"enum:DType.{node.attr}"
+    return None
+
+
+def _diff_ast_dict(old_dict: ast.Dict, new_dict: ast.Dict) -> Optional[Tuple[List[str], List[str]]]:
+    """Return (added_or_deleted_keys, modified_existing_keys) for static dict literals, or None if unsafe."""
+    old_splats: List[ast.AST] = []
+    new_splats: List[ast.AST] = []
+    old_map: Dict[str, ast.AST] = {}
+    new_map: Dict[str, ast.AST] = {}
+
+    for k, val in zip(old_dict.keys, old_dict.values):
+        if k is None:
+            old_splats.append(val)
+        else:
+            ck = _ast_canon_dict_key(k)
+            if ck is None or ck in old_map:
+                return None
+            old_map[ck] = val
+
+    for k, val in zip(new_dict.keys, new_dict.values):
+        if k is None:
+            new_splats.append(val)
+        else:
+            ck = _ast_canon_dict_key(k)
+            if ck is None or ck in new_map:
+                return None
+            new_map[ck] = val
+
+    if not _ast_list_eq(old_splats, new_splats):
+        return None
+
+    added_or_deleted = sorted(old_map.keys() ^ new_map.keys())
+    modified_existing = [k for k in sorted(old_map.keys() & new_map.keys()) if not _ast_eq(old_map[k], new_map[k])]
+    return added_or_deleted, modified_existing
+
+
+def _is_simple_scalar_ast(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub, ast.Invert, ast.Not)):
+        return isinstance(node.operand, ast.Constant)
+    if isinstance(node, ast.Name):
+        return True
+    if isinstance(node, ast.Attribute):
+        return _is_simple_scalar_ast(node.value)
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(_is_simple_scalar_ast(e) for e in node.elts)
+    return False
+
+
+def _extract_single_assign(stmt: ast.stmt) -> Optional[Tuple[str, ast.AST]]:
+    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+        return stmt.targets[0].id, stmt.value
+    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+        return stmt.target.id, stmt.value
+    return None
+
+
+def _count_target_assigns(stmts: Sequence[ast.stmt]) -> Dict[str, int]:
+    counts: Dict[str, int] = defaultdict(int)
+    for st in stmts:
+        if isinstance(st, ast.Assign):
+            for t in st.targets:
+                if isinstance(t, ast.Name):
+                    counts[t.id] += 1
+        elif isinstance(st, (ast.AnnAssign, ast.AugAssign)) and isinstance(st.target, ast.Name):
+            counts[st.target.id] += 1
+    return counts
+
+
+def _top_level_names(stmts: Sequence[ast.stmt]) -> Set[str]:
+    names: Set[str] = set()
+
+    def _collect_tgt(t: ast.AST) -> None:
+        if isinstance(t, ast.Name):
+            names.add(t.id)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                _collect_tgt(e)
+        elif isinstance(t, ast.Starred):
+            _collect_tgt(t.value)
+
+    for st in stmts:
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(st.name)
+        elif isinstance(st, ast.Assign):
+            for t in st.targets:
+                _collect_tgt(t)
+        elif isinstance(st, ast.AnnAssign):
+            _collect_tgt(st.target)
+        elif isinstance(st, (ast.Import, ast.ImportFrom)):
+            for alias in st.names:
+                if alias.name != "*":
+                    names.add(alias.asname or alias.name.split(".", 1)[0])
+    return names
+
+
+def _resolve_local_mod_path(
+    mod_name: str,
+    level: int,
+    rel_path: str,
+    src_root: Path,
+    added_paths: Set[str],
+    deleted_paths: Set[str],
+) -> Optional[str]:
+    if level > 0:
+        parts = rel_path.removesuffix(".py").split("/")
+        pkg_parts = parts[:-1]
+        up = level - 1
+        base = pkg_parts[: len(pkg_parts) - up] if up <= len(pkg_parts) else []
+        full = ".".join(base + ([mod_name] if mod_name else []))
+    else:
+        full = mod_name
+    if not (full == "sqlglot" or full.startswith("sqlglot.") or full == "tests" or full.startswith("tests.")):
+        return None
+    mparts = full.split(".")
+    cand1 = "/".join(mparts) + ".py"
+    cand2 = "/".join(mparts) + "/__init__.py"
+    for cand in (cand1, cand2):
+        if cand in added_paths:
+            return cand
+        if cand not in deleted_paths and (src_root / cand).is_file():
+            return cand
+    return "__MISSING__"
+
+
+def _has_broken_import(
+    old_stmts: Sequence[ast.stmt],
+    new_stmts: Sequence[ast.stmt],
+    rel_path: str,
+    src_root: Path,
+    added_paths: Set[str],
+    deleted_paths: Set[str],
+) -> bool:
+    """Detect added/changed local imports pointing to missing modules."""
+    old_imports = [st for st in old_stmts if isinstance(st, (ast.Import, ast.ImportFrom))]
+    for st in new_stmts:
+        if isinstance(st, (ast.Import, ast.ImportFrom)):
+            if any(_ast_eq(st, oi) for oi in old_imports):
+                continue
+            if isinstance(st, ast.Import):
+                for alias in st.names:
+                    res = _resolve_local_mod_path(alias.name, 0, rel_path, src_root, added_paths, deleted_paths)
+                    if res == "__MISSING__":
+                        return True
+            else:
+                res = _resolve_local_mod_path(st.module or "", st.level, rel_path, src_root, added_paths, deleted_paths)
+                if res == "__MISSING__":
+                    return True
+    return False
 
 
 def parse_git_diff(patch_text: str) -> List[Dict[str, Any]]:
@@ -215,6 +527,7 @@ def parse_git_diff(patch_text: str) -> List[Dict[str, Any]]:
                 "b_path": b_path,
                 "rel_path": b_path or a_path,
                 "status": "modified",
+                "renamed": False,
                 "hunks": [],
             }
             cur_hunk = None
@@ -240,10 +553,12 @@ def parse_git_diff(patch_text: str) -> List[Dict[str, Any]]:
                 continue
             if sline.startswith("rename from "):
                 cur["a_path"] = sline[12:].strip()
+                cur["renamed"] = True
                 continue
             if sline.startswith("rename to "):
                 cur["b_path"] = sline[10:].strip()
                 cur["rel_path"] = cur["b_path"]
+                cur["renamed"] = True
                 continue
         m = hunk_re.match(sline)
         if m:
@@ -274,7 +589,7 @@ def apply_hunks_in_memory(old_text: str, hunks: List[Dict[str, Any]]) -> Tuple[s
         return old_text, True
     old_lines = old_text.splitlines(keepends=True)
     out: List[str] = []
-    pos = 0  # 0-based index into old_lines
+    pos = 0
 
     for h in hunks:
         old_start = h["old_start"]
@@ -311,7 +626,7 @@ def apply_hunks_in_memory(old_text: str, hunks: List[Dict[str, Any]]) -> Tuple[s
 
 
 class SelectorEngine:
-    """Precomputed-map + AST-diff test selector."""
+    """Precomputed-map + AST-diff test selector using bitmask set algebra."""
 
     def __init__(self, tests_json: Dict[str, Any], maps: Dict[str, Any], src_root: Path) -> None:
         self.src_root = src_root
@@ -325,156 +640,269 @@ class SelectorEngine:
         self.func_to_num: Dict[Tuple[str, str], int] = {}
         self.all_nums: Set[int] = set()
 
+        self.file_to_livemask: Dict[str, int] = defaultdict(int)
+        self.class_to_livemask: Dict[Tuple[str, str], int] = defaultdict(int)
+        self.all_livemask: int = 0
+
         for t in tests:
             num = int(t["number"])
             tid = t["id"]
             tfile = t["file"]
             ms = math.floor(float(t["seconds"]) * 1000.0 + 0.5)
+            bit = 1 << num
             self.id_to_num[tid] = num
             self.num_to_ms[num] = ms
             self.file_to_nums[tfile].append(num)
+            self.file_to_livemask[tfile] |= bit
             self.all_nums.add(num)
+            self.all_livemask |= bit
             parts = tid.split("::")
             if len(parts) == 3:
                 self.class_to_nums[(tfile, parts[1])].append(num)
+                self.class_to_livemask[(tfile, parts[1])] |= bit
                 self.method_to_num[(tfile, parts[1], parts[2])] = num
             elif len(parts) == 2:
                 self.func_to_num[(tfile, parts[1])] = num
 
-        # Map baseline test indices -> live /data/tests.json numbers.
         test_ids: List[str] = maps["test_ids"]
         self.idx_to_num: List[Optional[int]] = [self.id_to_num.get(tid) for tid in test_ids]
+        self.id_to_base_idx: Dict[str, int] = {tid: i for i, tid in enumerate(test_ids)}
 
-        self.raw_line_cov: Dict[str, Dict[str, List[int]]] = maps.get("line_cov", {})
-        self.raw_file_access: Dict[str, List[int]] = maps.get("file_access", {})
-        self.raw_class_usage: Dict[str, List[int]] = maps.get("class_usage", {})
-        self.raw_pkg_walkers: Dict[str, List[int]] = maps.get("pkg_walkers", {})
+        self.file_to_basemask: Dict[str, int] = {}
+        for tfile, nums in self.file_to_nums.items():
+            bm = 0
+            for t in tests:
+                if t["file"] == tfile:
+                    bidx = self.id_to_base_idx.get(t["id"])
+                    if bidx is not None:
+                        bm |= 1 << bidx
+            self.file_to_basemask[tfile] = bm
+
+        self.is_v2 = int(maps.get("version", 1)) >= 2
+        self.raw_line_cov: Dict[str, Dict[Any, Any]] = maps.get("line_cov", {})
+        self.raw_file_access: Dict[str, Any] = maps.get("file_access", {})
+        self.raw_dir_access: Dict[str, Any] = maps.get("dir_access", {})
+        self.raw_class_usage: Dict[str, Any] = maps.get("class_usage", {})
+        self.raw_pkg_walkers: Dict[str, Any] = maps.get("pkg_walkers", {})
+        self.raw_dict_key_usage: Dict[str, Dict[str, Dict[str, Any]]] = maps.get("dict_key_usage", {})
+        self.tracked_dict_classes: Set[str] = set(maps.get("tracked_dict_classes", ()))
         self.rev_imports: Dict[str, List[str]] = maps.get("rev_imports", {})
         self.dialect_typing_links: Dict[str, List[str]] = maps.get("dialect_typing_links", {})
+        self.attr_read_lines: Dict[str, Dict[str, List[int]]] = maps.get("attr_read_lines", {})
+        self.attr_import_test_files: Dict[str, List[str]] = maps.get("attr_import_test_files", {})
+        self.metaclass_attrs: Set[str] = set(maps.get("metaclass_attrs", ()))
 
-        # Caches populated lazily per touched file for fast CPU time.
-        self._line_cache: Dict[str, Dict[int, Set[int]]] = {}
-        self._mod_cov_cache: Dict[str, Set[int]] = {}
-        self._file_acc_cache: Dict[str, Set[int]] = {}
-        self._cls_use_cache: Dict[str, Set[int]] = {}
+        # Precompute module -> union of class_usage masks cleanly in O(N).
+        self.mod_class_mask: Dict[str, int] = defaultdict(int)
+        for ckey, val in self.raw_class_usage.items():
+            mod = ckey.split("::", 1)[0]
+            self.mod_class_mask[mod] |= self._to_mask(val)
+        self._init_cls_usage_len = len(self.raw_class_usage)
+
+        # Caches populated lazily.
+        self._line_cache: Dict[str, Dict[int, int]] = {}
+        self._mod_cov_cache: Dict[str, int] = {}
+        self._file_acc_cache: Dict[str, int] = {}
+        self._dir_acc_cache: Dict[str, int] = {}
+        self._cls_use_cache: Dict[str, int] = {}
+        self._attr_reader_cache: Dict[str, int] = {}
         self._ast_cache: Dict[str, Tuple[str, Optional[ast.Module]]] = {}
+        self._lines_cache: Dict[str, Tuple[str, List[str]]] = {}
 
-    def _remap(self, idxs: Iterable[int]) -> Set[int]:
+    @staticmethod
+    def _to_mask(val: Any) -> int:
+        if isinstance(val, int):
+            return val
+        m = 0
+        if val:
+            for i in val:
+                m |= 1 << i
+        return m
+
+    def _decode_masks(self, base_mask: int, live_mask: int) -> Set[int]:
         out: Set[int] = set()
-        m = self.idx_to_num
-        for i in idxs:
-            n = m[i]
+        idx_to_num = self.idx_to_num
+        m = base_mask
+        while m:
+            lsb = m & -m
+            m ^= lsb
+            n = idx_to_num[lsb.bit_length() - 1]
             if n is not None:
                 out.add(n)
+        m = live_mask
+        while m:
+            lsb = m & -m
+            m ^= lsb
+            out.add(lsb.bit_length() - 1)
         return out
 
-    def _file_access(self, rel_path: str) -> Set[int]:
+    def _file_access(self, rel_path: str) -> int:
         cached = self._file_acc_cache.get(rel_path)
         if cached is None:
             raw = self.raw_file_access.get(rel_path)
-            cached = self._remap(raw) if raw else set()
+            cached = self._to_mask(raw) if raw else 0
             self._file_acc_cache[rel_path] = cached
         return cached
 
-    def _class_usage(self, cls_key: str) -> Set[int]:
+    def _dir_walker_tests(self, rel_path: str) -> int:
+        parent = rel_path.rsplit("/", 1)[0] if "/" in rel_path else "."
+        cached = self._dir_acc_cache.get(parent)
+        if cached is not None:
+            return cached
+        mask = 0
+        if self.raw_dir_access:
+            mask |= self._to_mask(self.raw_dir_access.get(".", 0))
+            if parent and parent != ".":
+                parts = parent.split("/")
+                cur = ""
+                for part in parts:
+                    cur = part if not cur else f"{cur}/{part}"
+                    if cur in self.raw_dir_access:
+                        mask |= self._to_mask(self.raw_dir_access[cur])
+        self._dir_acc_cache[parent] = mask
+        return mask
+
+    def _pkg_walker_tests(self, rel_path: str) -> int:
+        mask = 0
+        parent = rel_path.rsplit("/", 1)[0] if "/" in rel_path else ""
+        for pkg, raw in self.raw_pkg_walkers.items():
+            if parent == pkg or parent.startswith(pkg + "/"):
+                mask |= self._to_mask(raw)
+        return mask
+
+    def _class_usage(self, cls_key: str) -> int:
         cached = self._cls_use_cache.get(cls_key)
         if cached is None:
             raw = self.raw_class_usage.get(cls_key)
-            cached = self._remap(raw) if raw else set()
+            cached = self._to_mask(raw) if raw else 0
             self._cls_use_cache[cls_key] = cached
         return cached
 
-    def _line_map(self, rel_path: str) -> Dict[int, Set[int]]:
+    def _dict_key_mask(self, attr: str, cls_key: str, norm_key: str) -> int:
+        by_attr = self.raw_dict_key_usage.get(attr)
+        if not by_attr:
+            return 0
+        by_cls = by_attr.get(cls_key)
+        if not by_cls:
+            return 0
+        raw = by_cls.get(norm_key)
+        return self._to_mask(raw) if raw else 0
+
+    def _attr_reader_mask(self, attr: str) -> int:
+        cached = self._attr_reader_cache.get(attr)
+        if cached is not None:
+            return cached
+        mask = 0
+        rmap = self.attr_read_lines.get(attr)
+        if rmap:
+            for rel, lns in rmap.items():
+                mask |= self._lines_cov(rel, lns)
+        for tf in self.attr_import_test_files.get(attr, ()):
+            mask |= self.file_to_basemask.get(tf, 0)
+        self._attr_reader_cache[attr] = mask
+        return mask
+
+    def _line_map(self, rel_path: str) -> Dict[int, int]:
         cached = self._line_cache.get(rel_path)
         if cached is None:
             raw = self.raw_line_cov.get(rel_path)
             if not raw:
                 cached = {}
+            elif self.is_v2 and isinstance(next(iter(raw.keys())), int) and isinstance(next(iter(raw.values())), int):
+                cached = raw  # type: ignore[assignment]
             else:
-                idx_map = self.idx_to_num
                 cached = {}
                 for lns, idxs in raw.items():
-                    s = {idx_map[i] for i in idxs if idx_map[i] is not None}
-                    if s:
-                        cached[int(lns)] = s
+                    m = self._to_mask(idxs)
+                    if m:
+                        cached[int(lns)] = m
             self._line_cache[rel_path] = cached
         return cached
 
-    def _module_cov(self, rel_path: str) -> Set[int]:
+    def _module_cov(self, rel_path: str) -> int:
         cached = self._mod_cov_cache.get(rel_path)
         if cached is None:
             lmap = self._line_map(rel_path)
-            out: Set[int] = set()
-            for s in lmap.values():
-                out.update(s)
-            cached = out
+            m = 0
+            for lm in lmap.values():
+                m |= lm
+            cached = m
             self._mod_cov_cache[rel_path] = cached
         return cached
 
-    def _lines_cov(self, rel_path: str, lines: Iterable[int]) -> Set[int]:
+    def _lines_cov(self, rel_path: str, lines: Iterable[int]) -> int:
         lmap = self._line_map(rel_path)
         if not lmap:
-            return set()
-        out: Set[int] = set()
+            return 0
+        m = 0
         for ln in lines:
-            s = lmap.get(ln)
-            if s:
-                out.update(s)
-        return out
+            v = lmap.get(ln)
+            if v:
+                m |= v
+        return m
 
-    def _pkg_walker_tests(self, rel_path: str) -> Set[int]:
-        out: Set[int] = set()
-        parent = rel_path.rsplit("/", 1)[0] if "/" in rel_path else ""
-        for pkg, idxs in self.raw_pkg_walkers.items():
-            if parent == pkg or parent.startswith(pkg + "/"):
-                out.update(self._remap(idxs))
-        return out
-
-    def _baseline_src_and_ast(self, rel_path: str) -> Tuple[str, Optional[ast.Module]]:
+    def _baseline_src_ast_lines(self, rel_path: str) -> Tuple[str, Optional[ast.Module], List[str]]:
         cached = self._ast_cache.get(rel_path)
-        if cached is not None:
-            return cached
-        p = self.src_root / rel_path
-        if not p.is_file():
-            res = ("", None)
-            self._ast_cache[rel_path] = res
-            return res
-        src = p.read_text("utf-8", errors="replace")
-        try:
-            tree = ast.parse(src)
-        except SyntaxError:
-            tree = None
-        res = (src, tree)
-        self._ast_cache[rel_path] = res
-        return res
+        if cached is None:
+            p = self.src_root / rel_path
+            if not p.is_file():
+                cached = ("", None)
+                self._ast_cache[rel_path] = cached
+                self._lines_cache[rel_path] = ("", [])
+                return "", None, []
+            src = p.read_text("utf-8", errors="replace")
+            try:
+                tree: Optional[ast.Module] = ast.parse(src)
+            except SyntaxError:
+                tree = None
+            cached = (src, tree)
+            self._ast_cache[rel_path] = cached
+            lines = src.splitlines()
+            self._lines_cache[rel_path] = (src, lines)
+            return src, tree, lines
+        src, tree = cached
+        lc = self._lines_cache.get(rel_path)
+        if lc is None or lc[0] is not src:
+            lines = src.splitlines()
+            self._lines_cache[rel_path] = (src, lines)
+        else:
+            lines = lc[1]
+        return src, tree, lines
 
-    def _importer_test_files(self, rel_path: str) -> Set[int]:
-        out: Set[int] = set()
+    def _importer_test_livemask(self, rel_path: str) -> int:
+        m = 0
         for rev in self.rev_imports.get(rel_path, ()):
-            if rev in self.file_to_nums:
-                out.update(self.file_to_nums[rev])
-        return out
+            m |= self.file_to_livemask.get(rev, 0)
+        return m
 
-    def _module_wide_fallback(self, rel_path: str, old_ast: Optional[ast.Module]) -> Set[int]:
-        out: Set[int] = set()
-        out.update(self._file_access(rel_path))
-        out.update(self._pkg_walker_tests(rel_path))
-        out.update(self._module_cov(rel_path))
+    def _mod_classes_usage_mask(self, rel_path: str, old_mod: Optional[ast.Module]) -> int:
+        if old_mod is None:
+            return 0
+        if len(self.raw_class_usage) == self._init_cls_usage_len:
+            return self.mod_class_mask.get(rel_path, 0)
+        # Re-scan when raw_class_usage was mutated dynamically in unit tests.
+        prefix = f"{rel_path}::"
+        m = 0
+        for ckey in self.raw_class_usage:
+            if ckey.startswith(prefix):
+                m |= self._class_usage(ckey)
+        return m
 
-        # For sqlglot/typing/<d>.py, include tests of linked dialect classes.
+    def _module_wide_fallback(
+        self,
+        rel_path: str,
+        old_mod: Optional[ast.Module],
+        include_importers: bool = False,
+    ) -> Tuple[int, int]:
+        base = 0
+        live = 0
+        base |= self._file_access(rel_path)
+        base |= self._dir_walker_tests(rel_path)
+        base |= self._pkg_walker_tests(rel_path)
+        base |= self._module_cov(rel_path)
         for link_cls in self.dialect_typing_links.get(rel_path, ()):
-            out.update(self._class_usage(link_cls))
-
-        # Include class_usage for all classes defined in this module.
-        if old_ast is not None:
-            for node in ast.walk(old_ast):
-                if isinstance(node, ast.ClassDef):
-                    # Approximate top-level or nested class lookup by checking matching suffix keys.
-                    prefix = f"{rel_path}::"
-                    for ckey in self.raw_class_usage:
-                        if ckey.startswith(prefix):
-                            out.update(self._class_usage(ckey))
-                    break
+            base |= self._class_usage(link_cls)
+        base |= self._mod_classes_usage_mask(rel_path, old_mod)
 
         is_dialect_mod = (
             (
@@ -491,14 +919,35 @@ class SelectorEngine:
             )
             or rel_path.startswith("sqlglot/typing/")
         )
-        if not is_dialect_mod:
-            out.update(self._importer_test_files(rel_path))
-            if rel_path == "sqlglot/__init__.py":
-                out.update(self.all_nums)
-        return out
+        if include_importers or not is_dialect_mod or base == 0:
+            live |= self._importer_test_livemask(rel_path)
+        if rel_path == "sqlglot/__init__.py":
+            live |= self.all_livemask
+        return base, live
 
-    def _cls_key_candidates(self, rel_path: str, cls_stack: List[str]) -> str:
+    def _cls_key(self, rel_path: str, cls_stack: List[str]) -> str:
         return f"{rel_path}::{'.'.join(cls_stack)}"
+
+    def _lines_with_fallback(
+        self,
+        rel_path: str,
+        lines: Iterable[int],
+        cls_stack: List[str],
+        old_fn_root: ast.stmt,
+        old_mod: Optional[ast.Module],
+    ) -> Tuple[int, int]:
+        m = self._lines_cov(rel_path, lines)
+        if m:
+            return m, 0
+        fn0, fn1 = _stmt_span(old_fn_root)
+        m = self._lines_cov(rel_path, range(fn0, fn1 + 1))
+        if m:
+            return m, 0
+        if cls_stack:
+            m = self._class_usage(self._cls_key(rel_path, cls_stack))
+            if m:
+                return m, 0
+        return self._module_wide_fallback(rel_path, old_mod, include_importers=True)
 
     def _diff_fn_bodies(
         self,
@@ -507,102 +956,192 @@ class SelectorEngine:
         rel_path: str,
         cls_stack: List[str],
         old_fn_root: ast.stmt,
-        selected: Set[int],
-    ) -> None:
-        """Recursively diff two function-body statement lists cleanly."""
-        if old_stmts == new_stmts:
-            return
-        osigs = [_stmt_sig(s) for s in old_stmts]
-        nsigs = [_stmt_sig(s) for s in new_stmts]
+        old_mod: Optional[ast.Module],
+        old_lines: List[str],
+        new_lines: List[str],
+        use_fallback: bool = True,
+    ) -> Tuple[int, int]:
+        """Recursively diff two function-body statement lists, returning (base_mask, live_mask)."""
+        if _ast_list_eq(old_stmts, new_stmts):
+            return 0, 0
+        base = 0
+        live = 0
+
+        def _add_lines(lines: Iterable[int]) -> None:
+            nonlocal base, live
+            if use_fallback:
+                b, l = self._lines_with_fallback(rel_path, lines, cls_stack, old_fn_root, old_mod)
+                base |= b
+                live |= l
+            else:
+                base |= self._lines_cov(rel_path, lines)
+
+        osigs = [_stmt_sig(s, old_lines) for s in old_stmts]
+        nsigs = [_stmt_sig(s, new_lines) for s in new_stmts]
         sm = difflib.SequenceMatcher(None, osigs, nsigs, autojunk=False)
 
         for tag, i1, i2, j1, j2 in sm.get_opcodes():
             if tag == "equal":
-                # Same signature (nested def/cls name match) -> check full AST & recurse if changed.
                 for oi, nj in zip(range(i1, i2), range(j1, j2)):
                     os_ = old_stmts[oi]
                     ns_ = new_stmts[nj]
-                    if _node_dump(os_) != _node_dump(ns_):
-                        if isinstance(os_, (ast.FunctionDef, ast.AsyncFunctionDef)) and isinstance(
-                            ns_, (ast.FunctionDef, ast.AsyncFunctionDef)
-                        ):
-                            if _fn_signature_changed(os_, ns_):
-                                selected.update(self._lines_cov(rel_path, range(os_.lineno, (os_.end_lineno or os_.lineno) + 1)))
-                            else:
-                                self._diff_fn_bodies(os_.body, ns_.body, rel_path, cls_stack, os_, selected)
+                    if _node_same_fast(os_, ns_, old_lines, new_lines):
+                        continue
+                    if isinstance(os_, (ast.FunctionDef, ast.AsyncFunctionDef)) and isinstance(
+                        ns_, (ast.FunctionDef, ast.AsyncFunctionDef)
+                    ):
+                        if _fn_signature_changed(os_, ns_) or _fn_scope_shape(os_) != _fn_scope_shape(ns_):
+                            s0, s1 = _stmt_span(os_)
+                            _add_lines(range(s0, s1 + 1))
                         else:
-                            selected.update(self._lines_cov(rel_path, range(os_.lineno, (os_.end_lineno or os_.lineno) + 1)))
+                            b, l = self._diff_fn_bodies(
+                                os_.body, ns_.body, rel_path, cls_stack, os_, old_mod, old_lines, new_lines, use_fallback
+                            )
+                            base |= b
+                            live |= l
+                    else:
+                        s0, s1 = _stmt_span(os_)
+                        _add_lines(range(s0, s1 + 1))
                 continue
 
             if tag == "replace" and (i2 - i1) == 1 and (j2 - j1) == 1:
                 os_ = old_stmts[i1]
                 ns_ = new_stmts[j1]
-                # Try descending into matching compound control-flow statements.
+                if _node_same_fast(os_, ns_, old_lines, new_lines):
+                    continue
                 if type(os_) is type(ns_) and isinstance(os_, ast.If) and isinstance(ns_, ast.If):
-                    if _node_dump(os_.test) != _node_dump(ns_.test):
-                        selected.update(self._lines_cov(rel_path, _header_lines(os_)))
-                    if [_node_dump(x) for x in os_.body] != [_node_dump(x) for x in ns_.body]:
-                        self._diff_fn_bodies(os_.body, ns_.body, rel_path, cls_stack, os_, selected)
-                    if [_node_dump(x) for x in os_.orelse] != [_node_dump(x) for x in ns_.orelse]:
-                        self._diff_fn_bodies(os_.orelse, ns_.orelse, rel_path, cls_stack, os_, selected)
+                    if not _ast_eq(os_.test, ns_.test):
+                        _add_lines(_header_lines(os_))
+                    if not _ast_list_eq(os_.body, ns_.body):
+                        b, l = self._diff_fn_bodies(
+                            os_.body, ns_.body, rel_path, cls_stack, old_fn_root, old_mod, old_lines, new_lines, use_fallback
+                        )
+                        base |= b
+                        live |= l
+                    if not _ast_list_eq(os_.orelse, ns_.orelse):
+                        b, l = self._diff_fn_bodies(
+                            os_.orelse, ns_.orelse, rel_path, cls_stack, old_fn_root, old_mod, old_lines, new_lines, use_fallback
+                        )
+                        base |= b
+                        live |= l
                     continue
                 if type(os_) is type(ns_) and isinstance(os_, (ast.For, ast.AsyncFor)) and isinstance(ns_, (ast.For, ast.AsyncFor)):
-                    if _node_dump(os_.target) != _node_dump(ns_.target) or _node_dump(os_.iter) != _node_dump(ns_.iter):
-                        selected.update(self._lines_cov(rel_path, _header_lines(os_)))
+                    if not _ast_eq(os_.target, ns_.target) or not _ast_eq(os_.iter, ns_.iter):
+                        _add_lines(_header_lines(os_))
                     else:
-                        self._diff_fn_bodies(os_.body, ns_.body, rel_path, cls_stack, os_, selected)
-                        self._diff_fn_bodies(os_.orelse, ns_.orelse, rel_path, cls_stack, os_, selected)
+                        b1, l1 = self._diff_fn_bodies(
+                            os_.body, ns_.body, rel_path, cls_stack, old_fn_root, old_mod, old_lines, new_lines, use_fallback
+                        )
+                        b2, l2 = self._diff_fn_bodies(
+                            os_.orelse, ns_.orelse, rel_path, cls_stack, old_fn_root, old_mod, old_lines, new_lines, use_fallback
+                        )
+                        base |= b1 | b2
+                        live |= l1 | l2
                     continue
                 if type(os_) is type(ns_) and isinstance(os_, ast.While) and isinstance(ns_, ast.While):
-                    if _node_dump(os_.test) != _node_dump(ns_.test):
-                        selected.update(self._lines_cov(rel_path, _header_lines(os_)))
-                    self._diff_fn_bodies(os_.body, ns_.body, rel_path, cls_stack, os_, selected)
-                    self._diff_fn_bodies(os_.orelse, ns_.orelse, rel_path, cls_stack, os_, selected)
+                    if not _ast_eq(os_.test, ns_.test):
+                        _add_lines(_header_lines(os_))
+                    b1, l1 = self._diff_fn_bodies(
+                        os_.body, ns_.body, rel_path, cls_stack, old_fn_root, old_mod, old_lines, new_lines, use_fallback
+                    )
+                    b2, l2 = self._diff_fn_bodies(
+                        os_.orelse, ns_.orelse, rel_path, cls_stack, old_fn_root, old_mod, old_lines, new_lines, use_fallback
+                    )
+                    base |= b1 | b2
+                    live |= l1 | l2
                     continue
                 if type(os_) is type(ns_) and isinstance(os_, (ast.With, ast.AsyncWith)) and isinstance(ns_, (ast.With, ast.AsyncWith)):
-                    if [_node_dump(x) for x in os_.items] != [_node_dump(x) for x in ns_.items]:
-                        selected.update(self._lines_cov(rel_path, _header_lines(os_)))
+                    if not _ast_list_eq(os_.items, ns_.items):
+                        _add_lines(_header_lines(os_))
                     else:
-                        self._diff_fn_bodies(os_.body, ns_.body, rel_path, cls_stack, os_, selected)
+                        b, l = self._diff_fn_bodies(
+                            os_.body, ns_.body, rel_path, cls_stack, old_fn_root, old_mod, old_lines, new_lines, use_fallback
+                        )
+                        base |= b
+                        live |= l
                     continue
                 if type(os_) is type(ns_) and isinstance(os_, ast.Try) and isinstance(ns_, ast.Try):
-                    self._diff_fn_bodies(os_.body, ns_.body, rel_path, cls_stack, os_, selected)
-                    self._diff_fn_bodies(os_.orelse, ns_.orelse, rel_path, cls_stack, os_, selected)
-                    self._diff_fn_bodies(os_.finalbody, ns_.finalbody, rel_path, cls_stack, os_, selected)
-                    if len(os_.handlers) == len(ns_.handlers):
-                        for oh, nh in zip(os_.handlers, ns_.handlers):
-                            if _node_dump(oh) != _node_dump(nh):
-                                self._diff_fn_bodies(oh.body, nh.body, rel_path, cls_stack, oh, selected)  # type: ignore[arg-type]
+                    b1, l1 = self._diff_fn_bodies(
+                        os_.body, ns_.body, rel_path, cls_stack, old_fn_root, old_mod, old_lines, new_lines, use_fallback
+                    )
+                    b2, l2 = self._diff_fn_bodies(
+                        os_.orelse, ns_.orelse, rel_path, cls_stack, old_fn_root, old_mod, old_lines, new_lines, use_fallback
+                    )
+                    b3, l3 = self._diff_fn_bodies(
+                        os_.finalbody, ns_.finalbody, rel_path, cls_stack, old_fn_root, old_mod, old_lines, new_lines, use_fallback
+                    )
+                    base |= b1 | b2 | b3
+                    live |= l1 | l2 | l3
+                    if len(os_.handlers) != len(ns_.handlers):
+                        s0, s1 = _stmt_span(os_)
+                        _add_lines(range(s0, s1 + 1))
                     else:
-                        selected.update(self._lines_cov(rel_path, range(os_.lineno, (os_.end_lineno or os_.lineno) + 1)))
+                        for oh, nh in zip(os_.handlers, ns_.handlers):
+                            header_changed = (
+                                (oh.type is None) != (nh.type is None)
+                                or (oh.type is not None and not _ast_eq(oh.type, nh.type))
+                                or oh.name != nh.name
+                            )
+                            if header_changed:
+                                # Handler type/binding change affects anyone entering the try body.
+                                try_lines = range(os_.lineno, (os_.end_lineno or os_.lineno) + 1)
+                                _add_lines(try_lines)
+                            elif not _ast_list_eq(oh.body, nh.body):
+                                bh, lh = self._diff_fn_bodies(
+                                    oh.body, nh.body, rel_path, cls_stack, oh, old_mod, old_lines, new_lines, use_fallback
+                                )
+                                base |= bh
+                                live |= lh
                     continue
+
+            if tag == "replace" and (i2 - i1) == (j2 - j1):
+                # Filter out statements whose AST didn't change (e.g. comments/formatting).
+                any_real_diff = False
+                for oi, nj in zip(range(i1, i2), range(j1, j2)):
+                    os_ = old_stmts[oi]
+                    ns_ = new_stmts[nj]
+                    if _node_same_fast(os_, ns_, old_lines, new_lines):
+                        continue
+                    any_real_diff = True
+                    if _is_docstring_stmt(os_):
+                        fn0, fn1 = _stmt_span(old_fn_root)
+                        _add_lines(range(fn0, fn1 + 1))
+                    else:
+                        s0, s1 = _stmt_span(os_)
+                        _add_lines(range(s0, s1 + 1))
+                if not any_real_diff:
+                    continue
+                continue
 
             if tag in ("replace", "delete"):
                 for oi in range(i1, i2):
                     os_ = old_stmts[oi]
                     if _is_docstring_stmt(os_):
-                        # Docstring changed -> select callers of the enclosing function!
-                        selected.update(self._lines_cov(rel_path, range(old_fn_root.lineno, (old_fn_root.end_lineno or old_fn_root.lineno) + 1)))
+                        fn0, fn1 = _stmt_span(old_fn_root)
+                        _add_lines(range(fn0, fn1 + 1))
                     else:
-                        selected.update(self._lines_cov(rel_path, range(os_.lineno, (os_.end_lineno or os_.lineno) + 1)))
+                        s0, s1 = _stmt_span(os_)
+                        _add_lines(range(s0, s1 + 1))
 
             if tag == "insert":
-                # Statement(s) inserted into old_stmts at index i1 -> tests hitting adjacent
-                # executable statements in this exact straight-line block execute the new line.
                 cov_lines: List[int] = []
                 for idx in range(i1 - 1, -1, -1):
                     cand = old_stmts[idx]
                     if not _is_docstring_stmt(cand):
-                        cov_lines.extend(range(cand.lineno, (cand.end_lineno or cand.lineno) + 1))
+                        c0, c1 = _stmt_span(cand)
+                        cov_lines.extend(range(c0, c1 + 1))
                         break
                 for idx in range(i1, len(old_stmts)):
                     cand = old_stmts[idx]
                     if not _is_docstring_stmt(cand):
-                        cov_lines.extend(range(cand.lineno, (cand.end_lineno or cand.lineno) + 1))
+                        c0, c1 = _stmt_span(cand)
+                        cov_lines.extend(range(c0, c1 + 1))
                         break
                 if not cov_lines:
                     cov_lines.extend(_header_lines(old_fn_root))
-                selected.update(self._lines_cov(rel_path, cov_lines))
+                _add_lines(cov_lines)
+
+        return base, live
 
     def _diff_scope_stmts(
         self,
@@ -611,257 +1150,480 @@ class SelectorEngine:
         rel_path: str,
         cls_stack: List[str],
         old_mod: Optional[ast.Module],
-        selected: Set[int],
-    ) -> None:
-        """Diff Module or ClassDef body statement list."""
-        osigs = [_stmt_sig(s) for s in old_stmts]
-        nsigs = [_stmt_sig(s) for s in new_stmts]
+        old_lines: List[str],
+        new_lines: List[str],
+    ) -> Tuple[int, int]:
+        """Diff Module or ClassDef body statement list, returning (base_mask, live_mask)."""
+        base = 0
+        live = 0
+        osigs = [_stmt_sig(s, old_lines) for s in old_stmts]
+        nsigs = [_stmt_sig(s, new_lines) for s in new_stmts]
         sm = difflib.SequenceMatcher(None, osigs, nsigs, autojunk=False)
+        old_counts = _count_target_assigns(old_stmts)
+        new_counts = _count_target_assigns(new_stmts)
 
         for tag, i1, i2, j1, j2 in sm.get_opcodes():
             if tag == "equal":
                 for oi, nj in zip(range(i1, i2), range(j1, j2)):
                     os_ = old_stmts[oi]
                     ns_ = new_stmts[nj]
-                    if _node_dump(os_) == _node_dump(ns_):
+                    if _node_same_fast(os_, ns_, old_lines, new_lines):
                         continue
                     if isinstance(os_, ast.ClassDef) and isinstance(ns_, ast.ClassDef):
-                        # Check if bases / decorators / keywords on the ClassDef header itself changed!
                         header_diff = (
-                            [_node_dump(x) for x in os_.bases] != [_node_dump(x) for x in ns_.bases]
-                            or [_node_dump(x) for x in os_.keywords] != [_node_dump(x) for x in ns_.keywords]
-                            or [_node_dump(x) for x in os_.decorator_list] != [_node_dump(x) for x in ns_.decorator_list]
+                            not _ast_list_eq(os_.bases, ns_.bases)
+                            or not _ast_list_eq(os_.keywords, ns_.keywords)
+                            or not _ast_list_eq(os_.decorator_list, ns_.decorator_list)
                         )
                         cls_stack.append(os_.name)
+                        cls_key = self._cls_key(rel_path, cls_stack)
                         if header_diff:
-                            selected.update(self._class_usage(self._cls_key_candidates(rel_path, cls_stack)))
-                        self._diff_scope_stmts(os_.body, ns_.body, rel_path, cls_stack, old_mod, selected)
+                            cm = self._class_usage(cls_key)
+                            if cm:
+                                base |= cm
+                            else:
+                                fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+                                base |= fb
+                                live |= fl
+                        sb, sl = self._diff_scope_stmts(
+                            os_.body, ns_.body, rel_path, cls_stack, old_mod, old_lines, new_lines
+                        )
+                        base |= sb
+                        live |= sl
                         cls_stack.pop()
                     elif isinstance(os_, (ast.FunctionDef, ast.AsyncFunctionDef)) and isinstance(
                         ns_, (ast.FunctionDef, ast.AsyncFunctionDef)
                     ):
-                        fn_lines = range(os_.lineno, (os_.end_lineno or os_.lineno) + 1)
-                        if _fn_signature_changed(os_, ns_):
+                        s0, s1 = _stmt_span(os_)
+                        fn_lines = range(s0, s1 + 1)
+                        if _fn_signature_changed(os_, ns_) or _fn_scope_shape(os_) != _fn_scope_shape(ns_):
                             cov = self._lines_cov(rel_path, fn_lines)
-                            selected.update(cov)
-                            if cls_stack and not cov:
-                                selected.update(self._class_usage(self._cls_key_candidates(rel_path, cls_stack)))
+                            if cov:
+                                base |= cov
+                            elif cls_stack:
+                                cm = self._class_usage(self._cls_key(rel_path, cls_stack))
+                                if cm:
+                                    base |= cm
+                                else:
+                                    fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+                                    base |= fb
+                                    live |= fl
+                            else:
+                                fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+                                base |= fb
+                                live |= fl
                         else:
-                            self._diff_fn_bodies(os_.body, ns_.body, rel_path, cls_stack, os_, selected)
-                            # Check if function body edit was covered OR if untested override affects class:
-                            # (Do NOT inflate covered methods with class_usage!)
+                            b, l = self._diff_fn_bodies(
+                                os_.body, ns_.body, rel_path, cls_stack, os_, old_mod, old_lines, new_lines
+                            )
+                            base |= b
+                            live |= l
                 continue
 
-            # Changed / inserted / deleted statements directly inside Module or ClassDef!
-            if cls_stack:
-                cls_key = self._cls_key_candidates(rel_path, cls_stack)
-                # Special narrow path: Assign/AnnAssign inside ClassDef where ONLY nested Lambda body changed.
-                if tag == "replace" and (i2 - i1) == 1 and (j2 - j1) == 1:
-                    os_ = old_stmts[i1]
-                    ns_ = new_stmts[j1]
-                    ov = os_.value if isinstance(os_, (ast.Assign, ast.AnnAssign)) else None
-                    nv = ns_.value if isinstance(ns_, (ast.Assign, ast.AnnAssign)) else None
-                    same_target = (
-                        type(os_) is type(ns_)
-                        and isinstance(os_, ast.Assign)
-                        and isinstance(ns_, ast.Assign)
-                        and [_node_dump(t) for t in os_.targets] == [_node_dump(t) for t in ns_.targets]
-                    )
-                    if same_target and ov is not None and nv is not None:
+            if tag == "replace" and (i2 - i1) == 1 and (j2 - j1) == 1:
+                os_ = old_stmts[i1]
+                ns_ = new_stmts[j1]
+                if _node_same_fast(os_, ns_, old_lines, new_lines):
+                    continue
+
+                assigned_old = _extract_single_assign(os_)
+                assigned_new = _extract_single_assign(ns_)
+                if assigned_old is not None and assigned_new is not None and assigned_old[0] == assigned_new[0]:
+                    attr, ov = assigned_old
+                    _, nv = assigned_new
+
+                    if cls_stack:
+                        cls_key = self._cls_key(rel_path, cls_stack)
+                        # 1) Narrowest path: inner Lambda bodies inside a class dict/structure.
                         lambdas = _find_inner_lambdas_only(ov, nv)
                         if lambdas is not None:
+                            lam_mask = 0
                             for lam in lambdas:
-                                selected.update(self._lines_cov(rel_path, range(lam.lineno, (lam.end_lineno or lam.lineno) + 1)))
-                            continue
-                selected.update(self._class_usage(cls_key))
-                for oi in range(i1, i2):
-                    os_ = old_stmts[oi]
-                    selected.update(self._lines_cov(rel_path, range(os_.lineno, (os_.end_lineno or os_.lineno) + 1)))
-            else:
-                # Top-level Module change!
-                if tag == "replace" and (i2 - i1) == 1 and (j2 - j1) == 1:
-                    os_ = old_stmts[i1]
-                    ns_ = new_stmts[j1]
-                    if isinstance(os_, ast.Assign) and isinstance(ns_, ast.Assign):
-                        if [_node_dump(t) for t in os_.targets] == [_node_dump(t) for t in ns_.targets]:
-                            lambdas = _find_inner_lambdas_only(os_.value, ns_.value)
-                            if lambdas is not None:
-                                for lam in lambdas:
-                                    selected.update(self._lines_cov(rel_path, range(lam.lineno, (lam.end_lineno or lam.lineno) + 1)))
+                                lam_mask |= self._lines_cov(rel_path, range(lam.lineno, (lam.end_lineno or lam.lineno) + 1))
+                            if lam_mask:
+                                base |= lam_mask
                                 continue
-                # General module top-level edit: fall back to module-wide tests safely!
-                selected.update(self._module_wide_fallback(rel_path, old_mod))
-                return
+
+                        # 2) Tracked dict-key precision (when attr appears once in class and dict is tracked).
+                        if (
+                            attr in self.raw_dict_key_usage
+                            and cls_key in self.tracked_dict_classes
+                            and old_counts.get(attr, 0) == 1
+                            and new_counts.get(attr, 0) == 1
+                            and isinstance(ov, ast.Dict)
+                            and isinstance(nv, ast.Dict)
+                        ):
+                            dk_diff = _diff_ast_dict(ov, nv)
+                            if dk_diff is not None:
+                                added_or_deleted, modified_existing = dk_diff
+                                if added_or_deleted:
+                                    cm = self._class_usage(cls_key)
+                                    if cm:
+                                        base |= cm
+                                    else:
+                                        fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+                                        base |= fb
+                                        live |= fl
+                                elif modified_existing:
+                                    for kn in modified_existing:
+                                        base |= self._dict_key_mask(attr, cls_key, kn)
+                                    # Confirmed tracked dict with potentially 0 readers: do not inflate!
+                                    continue
+                                continue
+
+                        # 3) Scalar class-attribute intersection via runtime reader coverage.
+                        if (
+                            attr.isupper()
+                            and attr not in self.metaclass_attrs
+                            and old_counts.get(attr, 0) == 1
+                            and new_counts.get(attr, 0) == 1
+                            and _is_simple_scalar_ast(ov)
+                            and _is_simple_scalar_ast(nv)
+                            and attr in self.attr_read_lines
+                        ):
+                            cu = self._class_usage(cls_key)
+                            readers = self._attr_reader_mask(attr)
+                            if cu and readers:
+                                base |= cu & readers
+                                continue
+                    else:
+                        # Top-level single assignment (Module scope):
+                        lambdas = _find_inner_lambdas_only(ov, nv)
+                        if lambdas is not None:
+                            lam_mask = 0
+                            for lam in lambdas:
+                                lam_mask |= self._lines_cov(rel_path, range(lam.lineno, (lam.end_lineno or lam.lineno) + 1))
+                            if lam_mask:
+                                base |= lam_mask
+                                continue
+
+                        if (
+                            rel_path.startswith("sqlglot/typing/")
+                            and attr == "EXPRESSION_METADATA"
+                            and old_counts.get(attr, 0) == 1
+                            and new_counts.get(attr, 0) == 1
+                            and isinstance(ov, ast.Dict)
+                            and isinstance(nv, ast.Dict)
+                            and rel_path in self.dialect_typing_links
+                        ):
+                            dk_diff = _diff_ast_dict(ov, nv)
+                            if dk_diff is not None:
+                                added_or_deleted, modified_existing = dk_diff
+                                link_clss = self.dialect_typing_links[rel_path]
+                                if not added_or_deleted and modified_existing and link_clss and all(
+                                    lc in self.tracked_dict_classes for lc in link_clss
+                                ):
+                                    for lc in link_clss:
+                                        for kn in modified_existing:
+                                            base |= self._dict_key_mask("EXPRESSION_METADATA", lc, kn)
+                                    continue
+
+            # Filter pairwise AST-equal replacements before fallback!
+            if tag == "replace" and (i2 - i1) == (j2 - j1):
+                if all(_node_same_fast(old_stmts[oi], new_stmts[nj], old_lines, new_lines) for oi, nj in zip(range(i1, i2), range(j1, j2))):
+                    continue
+
+            if cls_stack:
+                cls_key = self._cls_key(rel_path, cls_stack)
+                cm = self._class_usage(cls_key)
+                lm = 0
+                for oi in range(i1, i2):
+                    s0, s1 = _stmt_span(old_stmts[oi])
+                    lm |= self._lines_cov(rel_path, range(s0, s1 + 1))
+                comb = cm | lm
+                if comb:
+                    base |= comb
+                else:
+                    fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+                    base |= fb
+                    live |= fl
+            else:
+                has_import_edit = any(
+                    isinstance(old_stmts[oi], (ast.Import, ast.ImportFrom)) for oi in range(i1, i2)
+                ) or any(isinstance(new_stmts[nj], (ast.Import, ast.ImportFrom)) for nj in range(j1, j2))
+                fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=has_import_edit)
+                base |= fb
+                live |= fl
+                return base, live
+
+        return base, live
 
     def _analyze_test_file(
         self,
         rel_path: str,
+        status: str,
         hunks: List[Dict[str, Any]],
-        selected: Set[int],
-    ) -> None:
-        old_src, old_mod = self._baseline_src_and_ast(rel_path)
+    ) -> Tuple[int, int]:
+        file_live = self.file_to_livemask.get(rel_path, 0)
+        imp_live = self._importer_test_livemask(rel_path)
+
+        if status == "deleted":
+            return 0, file_live | imp_live
+
+        old_src, old_mod, old_lines = self._baseline_src_ast_lines(rel_path)
         new_src, ok = apply_hunks_in_memory(old_src, hunks)
         if not ok or old_mod is None:
-            selected.update(self.file_to_nums.get(rel_path, ()))
-            return
+            return 0, file_live | imp_live
         try:
             new_mod = ast.parse(new_src)
         except SyntaxError:
-            selected.update(self.file_to_nums.get(rel_path, ()))
-            return
-
+            return 0, file_live | imp_live
         if _encoding_cookie(old_src) != _encoding_cookie(new_src):
-            selected.update(self.file_to_nums.get(rel_path, ()))
-            return
-        if _node_dump(old_mod) == _node_dump(new_mod):
-            selected.update(self._file_access(rel_path))
-            return
+            return 0, file_live | imp_live
+        if _ast_eq(old_mod, new_mod):
+            return self._file_access(rel_path), 0
 
-        # Diff test module top-level -> class -> test_* methods.
-        osigs = [_stmt_sig(s) for s in old_mod.body]
-        nsigs = [_stmt_sig(s) for s in new_mod.body]
+        new_lines = new_src.splitlines()
+        base = self._file_access(rel_path)
+        live = 0
+        osigs = [_stmt_sig(s, old_lines) for s in old_mod.body]
+        nsigs = [_stmt_sig(s, new_lines) for s in new_mod.body]
         sm = difflib.SequenceMatcher(None, osigs, nsigs, autojunk=False)
+
         for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "replace" and (i2 - i1) == (j2 - j1) and all(
+                _node_same_fast(old_mod.body[oi], new_mod.body[nj], old_lines, new_lines)
+                for oi, nj in zip(range(i1, i2), range(j1, j2))
+            ):
+                continue
             if tag != "equal":
-                selected.update(self.file_to_nums.get(rel_path, ()))
-                return
+                return base, live | file_live | imp_live
+
             for oi, nj in zip(range(i1, i2), range(j1, j2)):
                 os_ = old_mod.body[oi]
                 ns_ = new_mod.body[nj]
-                if _node_dump(os_) == _node_dump(ns_):
+                if _node_same_fast(os_, ns_, old_lines, new_lines):
                     continue
-                if isinstance(os_, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if isinstance(os_, (ast.FunctionDef, ast.AsyncFunctionDef)) and isinstance(
+                    ns_, (ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
                     num = self.func_to_num.get((rel_path, os_.name))
                     if num is not None:
-                        selected.add(num)
+                        live |= 1 << num
                     else:
-                        selected.update(self.file_to_nums.get(rel_path, ()))
-                        return
+                        # Shared helper function inside a test module -> check line_cov across all callers.
+                        if _fn_signature_changed(os_, ns_) or _fn_scope_shape(os_) != _fn_scope_shape(ns_):
+                            s0, s1 = _stmt_span(os_)
+                            bm = self._lines_cov(rel_path, range(s0, s1 + 1))
+                        else:
+                            bm, _ = self._diff_fn_bodies(
+                                os_.body, ns_.body, rel_path, [], os_, old_mod, old_lines, new_lines, use_fallback=False
+                            )
+                        if bm:
+                            base |= bm
+                        else:
+                            live |= file_live | imp_live
                 elif isinstance(os_, ast.ClassDef) and isinstance(ns_, ast.ClassDef):
-                    csigs_o = [_stmt_sig(s) for s in os_.body]
-                    csigs_n = [_stmt_sig(s) for s in ns_.body]
+                    cls_live = self.class_to_livemask.get((rel_path, os_.name), 0)
+                    header_diff = (
+                        not _ast_list_eq(os_.bases, ns_.bases)
+                        or not _ast_list_eq(os_.keywords, ns_.keywords)
+                        or not _ast_list_eq(os_.decorator_list, ns_.decorator_list)
+                    )
+                    if header_diff:
+                        live |= cls_live or (file_live | imp_live)
+                        if imp_live and cls_live == 0:
+                            live |= imp_live
+                    csigs_o = [_stmt_sig(s, old_lines) for s in os_.body]
+                    csigs_n = [_stmt_sig(s, new_lines) for s in ns_.body]
                     csm = difflib.SequenceMatcher(None, csigs_o, csigs_n, autojunk=False)
                     for ctag, ci1, ci2, cj1, cj2 in csm.get_opcodes():
                         if ctag == "equal":
                             for coi, cnj in zip(range(ci1, ci2), range(cj1, cj2)):
                                 cos = os_.body[coi]
                                 cns = ns_.body[cnj]
-                                if _node_dump(cos) != _node_dump(cns):
-                                    if isinstance(cos, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                                        mnum = self.method_to_num.get((rel_path, os_.name, cos.name))
-                                        if mnum is not None:
-                                            selected.add(mnum)
-                                        else:
-                                            selected.update(self.class_to_nums.get((rel_path, os_.name), ()))
+                                if _node_same_fast(cos, cns, old_lines, new_lines):
+                                    continue
+                                if isinstance(cos, (ast.FunctionDef, ast.AsyncFunctionDef)) and isinstance(
+                                    cns, (ast.FunctionDef, ast.AsyncFunctionDef)
+                                ):
+                                    mnum = self.method_to_num.get((rel_path, os_.name, cos.name))
+                                    if mnum is not None:
+                                        live |= 1 << mnum
                                     else:
-                                        selected.update(self.class_to_nums.get((rel_path, os_.name), ()))
+                                        # Helper/setup method (e.g. Validator.*, setUp) -> cover via line_cov + fallback.
+                                        if _fn_signature_changed(cos, cns) or _fn_scope_shape(cos) != _fn_scope_shape(cns):
+                                            s0, s1 = _stmt_span(cos)
+                                            bm = self._lines_cov(rel_path, range(s0, s1 + 1))
+                                        else:
+                                            bm, _ = self._diff_fn_bodies(
+                                                cos.body, cns.body, rel_path, [os_.name], cos, old_mod, old_lines, new_lines, use_fallback=False
+                                            )
+                                        if bm:
+                                            base |= bm
+                                        elif cls_live:
+                                            live |= cls_live
+                                        else:
+                                            live |= file_live | imp_live
+                                else:
+                                    live |= cls_live or (file_live | imp_live)
                         else:
+                            if ctag == "replace" and (ci2 - ci1) == (cj2 - cj1) and all(
+                                _node_same_fast(os_.body[coi], ns_.body[cnj], old_lines, new_lines)
+                                for coi, cnj in zip(range(ci1, ci2), range(cj1, cj2))
+                            ):
+                                continue
                             for coi in range(ci1, ci2):
                                 cos = os_.body[coi]
                                 if isinstance(cos, (ast.FunctionDef, ast.AsyncFunctionDef)):
                                     mnum = self.method_to_num.get((rel_path, os_.name, cos.name))
                                     if mnum is not None:
-                                        selected.add(mnum)
+                                        live |= 1 << mnum
                                         continue
-                                selected.update(self.class_to_nums.get((rel_path, os_.name), ()))
+                                    s0, s1 = _stmt_span(cos)
+                                    bm = self._lines_cov(rel_path, range(s0, s1 + 1))
+                                    if bm:
+                                        base |= bm
+                                        continue
+                                live |= cls_live or (file_live | imp_live)
+                            if ctag == "insert":
+                                live |= cls_live or (file_live | imp_live)
                 else:
-                    selected.update(self.file_to_nums.get(rel_path, ()))
-                    return
+                    return base, live | file_live | imp_live
+
+        return base, live
 
     def _analyze_py_source(
         self,
         rel_path: str,
         status: str,
         hunks: List[Dict[str, Any]],
-        selected: Set[int],
-    ) -> None:
+        added_paths: Set[str],
+        deleted_paths: Set[str],
+    ) -> Tuple[int, int]:
         if status == "added":
-            selected.update(self._pkg_walker_tests(rel_path))
-            return
+            return self._dir_walker_tests(rel_path) | self._pkg_walker_tests(rel_path), 0
 
-        old_src, old_mod = self._baseline_src_and_ast(rel_path)
+        old_src, old_mod, old_lines = self._baseline_src_ast_lines(rel_path)
         if status == "deleted" or old_mod is None:
-            selected.update(self._module_wide_fallback(rel_path, old_mod))
-            return
+            return self._module_wide_fallback(rel_path, old_mod, include_importers=True)
 
         new_src, ok = apply_hunks_in_memory(old_src, hunks)
         if not ok:
-            selected.update(self._module_wide_fallback(rel_path, old_mod))
-            return
+            return self._module_wide_fallback(rel_path, old_mod, include_importers=True)
 
         try:
             new_mod = ast.parse(new_src)
         except SyntaxError:
-            selected.update(self._module_wide_fallback(rel_path, old_mod))
-            return
+            return self._module_wide_fallback(rel_path, old_mod, include_importers=True)
 
         if _encoding_cookie(old_src) != _encoding_cookie(new_src):
-            selected.update(self._module_wide_fallback(rel_path, old_mod))
-            return
+            return self._module_wide_fallback(rel_path, old_mod, include_importers=True)
 
-        # Pure comment / formatting change (strings & docstrings ARE reflected in AST constants!).
-        if _node_dump(old_mod) == _node_dump(new_mod):
-            selected.update(self._file_access(rel_path))
-            return
+        base = self._file_access(rel_path)
+        if _ast_eq(old_mod, new_mod):
+            return base, 0
 
-        # Always include any tests that literally open/parse this source file (e.g. test_typing reads typing/*.py).
-        selected.update(self._file_access(rel_path))
-        self._diff_scope_stmts(old_mod.body, new_mod.body, rel_path, [], old_mod, selected)
+        live = 0
+        # Always check deleted top-level symbols or broken local imports.
+        if (_top_level_names(old_mod.body) - _top_level_names(new_mod.body)) or _has_broken_import(
+            old_mod.body, new_mod.body, rel_path, self.src_root, added_paths, deleted_paths
+        ):
+            fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+            base |= fb
+            live |= fl
+
+        new_lines = new_src.splitlines()
+        db, dl = self._diff_scope_stmts(
+            old_mod.body, new_mod.body, rel_path, [], old_mod, old_lines, new_lines
+        )
+        return base | db, live | dl
 
     def select_commit(self, patch_text: str) -> Set[int]:
         """Select all potentially impacted test numbers for a single commit patch."""
-        selected: Set[int] = set()
+        base_mask = 0
+        live_mask = 0
         sections = parse_git_diff(patch_text)
+
+        added_paths: Set[str] = set()
+        deleted_paths: Set[str] = set()
+        for sec in sections:
+            st = sec["status"]
+            rp = sec["rel_path"]
+            ap = sec["a_path"]
+            if st == "added" and rp:
+                added_paths.add(rp)
+            elif st == "deleted" and rp:
+                deleted_paths.add(rp)
+            elif sec.get("renamed") or (ap and rp and ap != rp):
+                if ap:
+                    deleted_paths.add(ap)
+                if rp:
+                    added_paths.add(rp)
 
         for sec in sections:
             rel_path = sec["rel_path"]
             a_path = sec["a_path"]
+            b_path = sec["b_path"]
             status = sec["status"]
             hunks = sec["hunks"]
+            is_rename = bool(sec.get("renamed") or (a_path and b_path and a_path != b_path))
 
             if not rel_path:
                 continue
 
-            if rel_path.endswith(".py"):
-                if rel_path in self.file_to_nums:
-                    self._analyze_test_file(rel_path, hunks, selected)
+            if is_rename and a_path and rel_path != a_path:
+                # Handle old path as deleted and new path as added.
+                if a_path.endswith(".py"):
+                    if a_path in self.file_to_livemask:
+                        live_mask |= self.file_to_livemask[a_path] | self._importer_test_livemask(a_path)
+                    else:
+                        _, old_a_mod, _ = self._baseline_src_ast_lines(a_path)
+                        fb, fl = self._module_wide_fallback(a_path, old_a_mod, include_importers=True)
+                        base_mask |= fb
+                        live_mask |= fl
                 else:
-                    self._analyze_py_source(rel_path, status, hunks, selected)
+                    base_mask |= self._file_access(a_path) | self._dir_walker_tests(a_path) | self._pkg_walker_tests(a_path)
+
+                if rel_path.endswith(".py"):
+                    base_mask |= self._dir_walker_tests(rel_path) | self._pkg_walker_tests(rel_path)
+                    if rel_path in self.file_to_livemask:
+                        live_mask |= self.file_to_livemask[rel_path]
+                else:
+                    base_mask |= self._file_access(rel_path) | self._dir_walker_tests(rel_path) | self._pkg_walker_tests(rel_path)
+                continue
+
+            if rel_path.endswith(".py"):
+                if rel_path in self.file_to_livemask:
+                    bm, lm = self._analyze_test_file(rel_path, status, hunks)
+                else:
+                    bm, lm = self._analyze_py_source(rel_path, status, hunks, added_paths, deleted_paths)
+                base_mask |= bm
+                live_mask |= lm
             else:
-                # Non-Python files (fixtures, CSVs, setup configs, docs).
-                acc = self._file_access(rel_path) | (self._file_access(a_path) if a_path and a_path != rel_path else set())
+                acc = (
+                    self._file_access(rel_path)
+                    | (self._file_access(a_path) if a_path and a_path != rel_path else 0)
+                    | self._dir_walker_tests(rel_path)
+                    | self._pkg_walker_tests(rel_path)
+                )
                 if acc:
-                    selected.update(acc)
+                    base_mask |= acc
                     continue
 
                 if rel_path.startswith("tests/"):
-                    # Added or untracked fixture file inside tests/ -> match directory / sibling file access.
                     parent = rel_path.rsplit("/", 1)[0] + "/"
-                    dir_hits: Set[int] = set()
-                    for k, idxs in self.raw_file_access.items():
+                    dir_hits = 0
+                    for k, raw in self.raw_file_access.items():
                         if k.startswith(parent):
-                            dir_hits.update(self._remap(idxs))
+                            dir_hits |= self._to_mask(raw)
                     if dir_hits:
-                        selected.update(dir_hits)
+                        base_mask |= dir_hits
                     else:
-                        selected.update(self.all_nums)
+                        live_mask |= self.all_livemask
                 else:
                     fname = rel_path.rsplit("/", 1)[-1]
                     ext = ("." + fname.rsplit(".", 1)[-1].lower()) if "." in fname else ""
                     if ext in _INERT_EXTS or fname in _INERT_NAMES or rel_path.startswith(("docs/", ".github/")):
                         continue
-                    # Package config / build metadata (e.g. pyproject.toml, setup.py, sqlglotc files).
-                    pkg_hits = self._pkg_walker_tests(rel_path)
-                    if pkg_hits:
-                        selected.update(pkg_hits)
-                    elif rel_path.startswith("sqlglot/"):
-                        selected.update(self.all_nums)
+                    if rel_path.startswith("sqlglot/"):
+                        live_mask |= self.all_livemask
 
-        return selected
+        return self._decode_masks(base_mask, live_mask)
 
 
 def pack_workers(selected_nums: Set[int], num_to_ms: List[int]) -> List[List[int]]:
-    """Optimal LPT + local refinement over k = 1..8 minimizing max(load) + 2000*k."""
+    """Optimal LPT + 1-move/2-swap local refinement over k = 1..8 minimizing max(load) + 2000*k."""
     if not selected_nums:
         return []
 
@@ -869,14 +1631,12 @@ def pack_workers(selected_nums: Set[int], num_to_ms: List[int]) -> List[List[int
     n = len(ordered)
     max_k = min(MAX_WORKERS, n)
 
-    # Fast exact k=1.
     total_ms = sum(num_to_ms[x] for x in ordered)
     best_cost = total_ms + WORKER_COST_MS
     best_bins: List[List[int]] = [ordered]
     slowest_ms = num_to_ms[ordered[0]]
 
     for k in range(2, max_k + 1):
-        # Lower bound pruning: cannot beat slowest test or balanced average + k*2000.
         lb = max(slowest_ms, (total_ms + k - 1) // k) + WORKER_COST_MS * k
         if lb >= best_cost:
             continue
@@ -885,7 +1645,6 @@ def pack_workers(selected_nums: Set[int], num_to_ms: List[int]) -> List[List[int
         loads = [0] * k
         for tnum in ordered:
             dur = num_to_ms[tnum]
-            # Find bin with minimum load.
             min_i = 0
             min_l = loads[0]
             for i in range(1, k):
@@ -896,8 +1655,7 @@ def pack_workers(selected_nums: Set[int], num_to_ms: List[int]) -> List[List[int
             bins[min_i].append(tnum)
             loads[min_i] = min_l + dur
 
-        # Lightweight 1-item move refinement from busiest worker to lightest workers.
-        for _ in range(32):
+        for _ in range(64):
             hi = 0
             hi_l = loads[0]
             lo = 0
@@ -910,26 +1668,64 @@ def pack_workers(selected_nums: Set[int], num_to_ms: List[int]) -> List[List[int
                 if li < lo_l:
                     lo_l = li
                     lo = i
-            if hi == lo or len(bins[hi]) <= 1:
+            if hi == lo or not bins[hi]:
                 break
+
             improved = False
-            gap = hi_l - lo_l
-            best_idx = -1
-            best_new_max = hi_l
-            for pos, tnum in enumerate(bins[hi]):
-                w = num_to_ms[tnum]
-                if 0 < w < gap:
-                    new_max = max(hi_l - w, lo_l + w)
-                    if new_max < best_new_max:
-                        best_new_max = new_max
-                        best_idx = pos
-            if best_idx >= 0:
-                moved = bins[hi].pop(best_idx)
-                w = num_to_ms[moved]
-                bins[lo].append(moved)
-                loads[hi] -= w
-                loads[lo] += w
-                improved = True
+            if len(bins[hi]) > 1:
+                gap = hi_l - lo_l
+                best_idx = -1
+                best_new_max = hi_l
+                for pos, tnum in enumerate(bins[hi]):
+                    w = num_to_ms[tnum]
+                    if 0 < w < gap:
+                        new_max = hi_l - w if hi_l - w >= lo_l + w else lo_l + w
+                        if new_max < best_new_max:
+                            best_new_max = new_max
+                            best_idx = pos
+                if best_idx >= 0:
+                    moved = bins[hi].pop(best_idx)
+                    w = num_to_ms[moved]
+                    bins[lo].append(moved)
+                    loads[hi] -= w
+                    loads[lo] += w
+                    improved = True
+            if improved:
+                continue
+
+            if len(bins[hi]) <= 150:
+                best_swap: Optional[Tuple[int, int, int, int]] = None
+                best_pair_max = hi_l
+                bin_hi = bins[hi]
+                for j in range(k):
+                    if j == hi:
+                        continue
+                    jl = loads[j]
+                    if jl >= hi_l:
+                        continue
+                    bin_j = bins[j]
+                    for pi, ti in enumerate(bin_hi):
+                        wi = num_to_ms[ti]
+                        for pj, tj in enumerate(bin_j):
+                            wj = num_to_ms[tj]
+                            delta = wi - wj
+                            if delta <= 0:
+                                continue
+                            n_hi = hi_l - delta
+                            n_j = jl + delta
+                            pair_max = n_hi if n_hi >= n_j else n_j
+                            if pair_max < best_pair_max:
+                                best_pair_max = pair_max
+                                best_swap = (j, pi, pj, delta)
+                if best_swap is not None:
+                    j, pi, pj, delta = best_swap
+                    ti = bins[hi][pi]
+                    tj = bins[j][pj]
+                    bins[hi][pi] = tj
+                    bins[j][pj] = ti
+                    loads[hi] -= delta
+                    loads[j] += delta
+                    improved = True
             if not improved:
                 break
 
@@ -941,13 +1737,21 @@ def pack_workers(selected_nums: Set[int], num_to_ms: List[int]) -> List[List[int
     return best_bins
 
 
+def load_maps(maps_path: Path) -> Dict[str, Any]:
+    name = maps_path.name.lower()
+    if name.endswith(".zlib"):
+        return pickle.loads(zlib.decompress(maps_path.read_bytes()))
+    if name.endswith(".pkl"):
+        return pickle.loads(maps_path.read_bytes())
+    if name.endswith(".gz"):
+        with gzip.open(maps_path, "rb") as f:
+            return json.loads(f.read().decode("utf-8"))
+    return json.loads(maps_path.read_text("utf-8"))
+
+
 def main() -> None:
     tests_json = json.loads((DATA_DIR / "tests.json").read_text("utf-8"))
-    if MAPS_PATH.suffix == ".gz":
-        with gzip.open(MAPS_PATH, "rb") as f:
-            maps = json.loads(f.read().decode("utf-8"))
-    else:
-        maps = json.loads(MAPS_PATH.read_text("utf-8"))
+    maps = load_maps(MAPS_PATH)
 
     engine = SelectorEngine(tests_json, maps, SQLGLOT_SRC)
     commits_dir = DATA_DIR / "commits"
