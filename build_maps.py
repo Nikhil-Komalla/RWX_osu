@@ -112,6 +112,63 @@ def _install_sync_executor() -> None:
     concurrent.futures.ProcessPoolExecutor = SyncExecutor  # type: ignore[misc]
 
 
+def _install_unittest_lifecycle_hook(
+    enter_ctx: Callable[[str], str],
+    exit_ctx: Callable[[str], None],
+) -> Tuple[Dict[type, str], Callable[[], None]]:
+    """Wrap setUpClass and tearDownClass BEFORE pytest binds them during collection.
+
+    In pytest 9, UnitTestCase._register_unittest_setup_class_fixture captures
+    `setup = getattr(cls, "setUpClass", None)` during collection, before
+    pytest_collection_modifyitems runs. Wrapping during collection ensures class
+    setup/teardown lines and file/class hooks run under `__CLS__::<qualname>`.
+    """
+    import _pytest.unittest as _pu
+
+    cls_to_tag: Dict[type, str] = {}
+    wrapped: Set[Tuple[type, str]] = set()
+    originals: List[Tuple[type, str, Any]] = []
+
+    def _make_wrapped(fn: Callable[..., Any]) -> classmethod:
+        @classmethod  # type: ignore[misc]
+        def _wrapped(c: type) -> Any:
+            tag = cls_to_tag.get(c) or f"__CLS__::{c.__module__}.{c.__qualname__}"
+            prev = enter_ctx(tag)
+            try:
+                return fn(c)
+            finally:
+                exit_ctx(prev)
+
+        return _wrapped
+
+    orig_reg = _pu.UnitTestCase._register_unittest_setup_class_fixture
+
+    def _hooked_register(self_ut: Any, cls: type) -> Any:
+        cls_to_tag[cls] = f"__CLS__::{cls.__module__}.{cls.__qualname__}"
+        for owner in cls.__mro__:
+            if owner is object or owner is unittest.TestCase:
+                continue
+            for attr_name in ("setUpClass", "tearDownClass"):
+                key = (owner, attr_name)
+                if key in wrapped or attr_name not in owner.__dict__:
+                    continue
+                wrapped.add(key)
+                orig_desc = owner.__dict__[attr_name]
+                originals.append((owner, attr_name, orig_desc))
+                raw_fn = orig_desc.__func__ if isinstance(orig_desc, classmethod) else orig_desc
+                setattr(owner, attr_name, _make_wrapped(raw_fn))
+        return orig_reg(self_ut, cls)
+
+    _pu.UnitTestCase._register_unittest_setup_class_fixture = _hooked_register  # type: ignore[method-assign]
+
+    def _restore() -> None:
+        _pu.UnitTestCase._register_unittest_setup_class_fixture = orig_reg  # type: ignore[method-assign]
+        for owner, attr_name, orig_desc in reversed(originals):
+            setattr(owner, attr_name, orig_desc)
+
+    return cls_to_tag, _restore
+
+
 def _wrap_test_class_lifecycle(
     items: Any,
     cls_to_nodeids: Dict[type, List[str]],
@@ -205,7 +262,9 @@ def run_pass1_coverage(repo: pathlib.Path, out_cov_file: pathlib.Path) -> Tuple[
         def pytest_collection_modifyitems(self, items):
             for item in items:
                 collected_nodeids.append(item.nodeid)
-            _wrap_test_class_lifecycle(items, cls_to_nodeids, _enter_ctx, _exit_ctx)
+                cls = getattr(item, "cls", None)
+                if cls is not None:
+                    cls_to_nodeids[cls].append(item.nodeid)
 
         def pytest_runtest_protocol(self, item, nextitem):
             cur_path = getattr(item, "path", None)
@@ -229,7 +288,11 @@ def run_pass1_coverage(repo: pathlib.Path, out_cov_file: pathlib.Path) -> Tuple[
                 cur_ctx_stack.pop()
             cov.switch_context(cur_ctx_stack[-1])
 
-    rc = pytest.main(["-q", "--no-header", "tests"], plugins=[CovPlugin()])
+    cls_to_tag, restore_lifecycle = _install_unittest_lifecycle_hook(_enter_ctx, _exit_ctx)
+    try:
+        rc = pytest.main(["-q", "--no-header", "tests"], plugins=[CovPlugin()])
+    finally:
+        restore_lifecycle()
     cov.stop()
     cov.save()
     dt = time.perf_counter() - t0
@@ -775,29 +838,24 @@ def run_pass2_dynamic_hooks(
                     _record_pkg(rel)
         return orig_walk_packages(path, prefix, onerror)
 
-    cls_to_tag: Dict[type, str] = {}
-    lifecycle_originals: List[Tuple[type, str, Any]] = []
+    def _enter_p2(tag: str) -> str:
+        prev = state["ctx"]
+        if tag != prev:
+            _switch(tag)
+        return prev
+
+    def _exit_p2(prev: str) -> None:
+        if state["ctx"] != prev:
+            _switch(prev)
+
+    cls_to_tag, restore_lifecycle = _install_unittest_lifecycle_hook(_enter_p2, _exit_p2)
 
     class HookPlugin:
         def pytest_collection_modifyitems(self, items):
-            nonlocal cls_to_tag, lifecycle_originals
-
-            def _enter_p2(tag: str) -> str:
-                prev = state["ctx"]
-                if tag != prev:
-                    _switch(tag)
-                return prev
-
-            def _exit_p2(prev: str) -> None:
-                if state["ctx"] != prev:
-                    _switch(prev)
-
-            cls_to_tag, lifecycle_originals = _wrap_test_class_lifecycle(
-                items,
-                cls_to_nodeids,
-                _enter_p2,
-                _exit_p2,
-            )
+            for item in items:
+                cls = getattr(item, "cls", None)
+                if cls is not None:
+                    cls_to_nodeids[cls].append(item.nodeid)
 
         def pytest_runtest_protocol(self, item, nextitem):
             _switch(item.nodeid)
@@ -879,8 +937,7 @@ def run_pass2_dynamic_hooks(
         SqlglotError.__init__ = orig_err_init  # type: ignore[method-assign]
         pkgutil.iter_modules = orig_iter_modules
         pkgutil.walk_packages = orig_walk_packages
-        for owner, attr_name, orig_desc in lifecycle_originals:
-            setattr(owner, attr_name, orig_desc)
+        restore_lifecycle()
         for owner, attr_name, orig_d in wrapped_dict_originals:
             setattr(owner, attr_name, orig_d)
         for cls, orig_dc in wrapped_dispatch_originals.items():
@@ -1051,12 +1108,21 @@ def build_static_graphs(
         if rel.startswith("sqlglot/dialects/") and cls_names:
             dialect_mod_classes[rel] = [f"{rel}::{cname}" for cname in cls_names]
 
+        def _add_dep(src_rel: str, dep_rel: Optional[str]) -> None:
+            if not dep_rel or dep_rel == src_rel:
+                return
+            direct[src_rel].add(dep_rel)
+            parts = dep_rel.split("/")
+            # Importing a.b.c in Python executes ancestor a/__init__.py, a/b/__init__.py first.
+            for i in range(1, len(parts)):
+                pkg_init = "/".join(parts[:i]) + "/__init__.py"
+                if pkg_init in rel_set and pkg_init != src_rel:
+                    direct[src_rel].add(pkg_init)
+
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    trel = _mod_to_rel(alias.name)
-                    if trel and trel != rel:
-                        direct[rel].add(trel)
+                    _add_dep(rel, _mod_to_rel(alias.name))
             elif isinstance(node, ast.ImportFrom):
                 if node.level > 0:
                     up = node.level - 1
@@ -1066,18 +1132,15 @@ def build_static_graphs(
                     base_mod = node.module or ""
                 if base_mod:
                     trel = _mod_to_rel(base_mod)
-                    if trel and trel != rel:
-                        direct[rel].add(trel)
-                        if trel.startswith("sqlglot/typing/") and rel.startswith("sqlglot/dialects/") and cls_names:
-                            for cname in cls_names:
-                                typing_links[trel].add(f"{rel}::{cname}")
+                    _add_dep(rel, trel)
+                    if trel and trel != rel and trel.startswith("sqlglot/typing/") and rel.startswith("sqlglot/dialects/") and cls_names:
+                        for cname in cls_names:
+                            typing_links[trel].add(f"{rel}::{cname}")
                 for alias in node.names:
                     if alias.name == "*":
                         continue
                     sub_mod = f"{base_mod}.{alias.name}" if base_mod else alias.name
-                    trel2 = _mod_to_rel(sub_mod)
-                    if trel2 and trel2 != rel:
-                        direct[rel].add(trel2)
+                    _add_dep(rel, _mod_to_rel(sub_mod))
 
     rev_direct: Dict[str, Set[str]] = defaultdict(set)
     for src_mod, deps in direct.items():
@@ -1421,7 +1484,7 @@ def main() -> None:
     }
     payload["version"] = 3
     raw_bytes = pickle.dumps(payload, protocol=5)
-    comp_bytes = zlib.compress(raw_bytes, level=1)
+    comp_bytes = zlib.compress(raw_bytes, level=9)
     out_path.write_bytes(comp_bytes)
     print(
         f"[DONE] Saved {out_path} ({len(comp_bytes) / 1024:.1f} KiB compressed, {len(raw_bytes) / 1024:.1f} KiB raw)",

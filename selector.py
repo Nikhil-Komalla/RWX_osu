@@ -26,6 +26,15 @@ SQLGLOT_SRC = Path(os.environ.get("BLAST_SQLGLOT_DIR", str(DEFAULT_SRC)))
 
 DEFAULT_MAPS = Path(__file__).resolve().parent / "maps" / "blast_maps.pkl.zlib"
 MAPS_PATH = Path(os.environ.get("BLAST_MAPS_PATH", str(DEFAULT_MAPS)))
+DEFAULT_MAPS_V1 = Path(__file__).resolve().parent / "maps" / "blast_maps_v1.pkl.zlib"
+MAPS_V1_PATH = Path(os.environ.get("BLAST_V1_MAPS_PATH", str(DEFAULT_MAPS_V1)))
+
+TRACE = os.environ.get("BLAST_TRACE") == "1"
+DEFAULT_DISABLED: Set[str] = set()
+_INIT_DISABLE_ENV = os.environ.get("BLAST_DISABLE", "")
+_INIT_ENABLE_ENV = os.environ.get("BLAST_ENABLE", "")
+ENABLED = {x.strip() for x in _INIT_ENABLE_ENV.split(",") if x.strip()}
+DISABLED = (DEFAULT_DISABLED - ENABLED) | {x.strip() for x in _INIT_DISABLE_ENV.split(",") if x.strip()}
 
 MAX_WORKERS = 8
 WORKER_COST_MS = 2000
@@ -510,6 +519,7 @@ def parse_git_diff(patch_text: str) -> List[Dict[str, Any]]:
     files: List[Dict[str, Any]] = []
     cur: Optional[Dict[str, Any]] = None
     cur_hunk: Optional[Dict[str, Any]] = None
+    cur_raw: List[str] = []
 
     lines = patch_text.splitlines(keepends=True)
     hunk_re = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -518,7 +528,9 @@ def parse_git_diff(patch_text: str) -> List[Dict[str, Any]]:
         sline = line.rstrip("\r\n")
         if sline.startswith("diff --git "):
             if cur is not None:
+                cur["raw_diff"] = "".join(cur_raw)
                 files.append(cur)
+            cur_raw = [line]
             parts = sline.split()
             a_path = parts[2][2:] if len(parts) >= 4 and parts[2].startswith("a/") else ""
             b_path = parts[3][2:] if len(parts) >= 4 and parts[3].startswith("b/") else ""
@@ -528,13 +540,18 @@ def parse_git_diff(patch_text: str) -> List[Dict[str, Any]]:
                 "rel_path": b_path or a_path,
                 "status": "modified",
                 "renamed": False,
+                "binary": False,
                 "hunks": [],
             }
             cur_hunk = None
             continue
         if cur is None:
             continue
+        cur_raw.append(line)
         if cur_hunk is None:
+            if sline.startswith("Binary files ") or sline == "GIT binary patch":
+                cur["binary"] = True
+                continue
             if sline.startswith("--- "):
                 p = sline[4:].strip()
                 if p == "/dev/null":
@@ -579,6 +596,7 @@ def parse_git_diff(patch_text: str) -> List[Dict[str, Any]]:
             cur_hunk["lines"].append(line if sline != "" else " \n")
 
     if cur is not None:
+        cur["raw_diff"] = "".join(cur_raw)
         files.append(cur)
     return files
 
@@ -695,6 +713,13 @@ class SelectorEngine:
         self.path_mentions: Dict[str, List[str]] = maps.get("path_mentions", {})
         self.lazy_test_importers: Dict[str, List[str]] = maps.get("lazy_test_importers", {})
         self._once_cache: Dict[str, frozenset] = {}
+        self._pkg_lazy_cache: Dict[str, int] = {}
+
+        self._trace: bool = TRACE
+        self.reasons: List[str] = []
+        self._reason_seen: Set[str] = set()
+        self._empty_guard_pending: Dict[str, Tuple[int, int, str]] = {}
+        self._last_num_sections: int = 0
 
         # Precompute module -> union of class_usage masks cleanly in O(N).
         self.mod_class_mask: Dict[str, int] = defaultdict(int)
@@ -892,6 +917,42 @@ class SelectorEngine:
                 m |= self._class_usage(ckey)
         return m
 
+    def _rule_enabled(self, name: str) -> bool:
+        cur_dis = os.environ.get("BLAST_DISABLE", "")
+        cur_ena = os.environ.get("BLAST_ENABLE", "")
+        if cur_dis != _INIT_DISABLE_ENV or cur_ena != _INIT_ENABLE_ENV:
+            ena = {x.strip() for x in cur_ena.split(",") if x.strip()}
+            dis = (DEFAULT_DISABLED - ena) | {x.strip() for x in cur_dis.split(",") if x.strip()}
+            return name not in dis
+        return name not in DISABLED
+
+    def _note(self, tag: str) -> None:
+        if self._trace and tag not in self._reason_seen:
+            self._reason_seen.add(tag)
+            self.reasons.append(tag)
+
+    def _lazy_test_livemask(self, rel_path: str) -> int:
+        m = 0
+        for tf in self.lazy_test_importers.get(rel_path, ()):
+            m |= self.file_to_livemask.get(tf, 0)
+        return m
+
+    def _pkg_sibling_lazy_livemask(self, pkg: str) -> int:
+        if not pkg:
+            return 0
+        cached = self._pkg_lazy_cache.get(pkg)
+        if cached is not None:
+            return cached
+        m = self._lazy_test_livemask(f"{pkg}/__init__.py")
+        prefix = pkg + "/"
+        target_slashes = pkg.count("/") + 1
+        for k, tfs in self.lazy_test_importers.items():
+            if k.startswith(prefix) and k.count("/") == target_slashes:
+                for tf in tfs:
+                    m |= self.file_to_livemask.get(tf, 0)
+        self._pkg_lazy_cache[pkg] = m
+        return m
+
     def _module_wide_fallback(
         self,
         rel_path: str,
@@ -923,10 +984,14 @@ class SelectorEngine:
             )
             or rel_path.startswith("sqlglot/typing/")
         )
+        added_imp = False
         if include_importers or not is_dialect_mod or base == 0:
             live |= self._importer_test_livemask(rel_path)
+            added_imp = True
         if rel_path == "sqlglot/__init__.py":
             live |= self.all_livemask
+        if self._trace:
+            self._note(f"module_wide:{rel_path}{'+imp' if added_imp else ''}")
         return base, live
 
     def _cls_key(self, rel_path: str, cls_stack: List[str]) -> str:
@@ -935,8 +1000,9 @@ class SelectorEngine:
     def _once_escalation(self, rel_path: str, old_mod: Optional[ast.Module]) -> Tuple[int, int]:
         """Module-wide users + static importers + tests reaching the module through lazy imports."""
         b, l = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
-        for tf in self.lazy_test_importers.get(rel_path, ()):
-            l |= self.file_to_livemask.get(tf, 0)
+        l |= self._lazy_test_livemask(rel_path)
+        if self._trace:
+            self._note(f"once:{rel_path}")
         return b, l
 
     def _touches_once_lines(self, rel_path: str, lines: Sequence[int], fn_root: Optional[ast.AST]) -> bool:
@@ -971,14 +1037,21 @@ class SelectorEngine:
             return b | self._lines_cov(rel_path, lines), l
         m = self._lines_cov(rel_path, lines)
         if m:
+            if self._trace:
+                self._note(f"cov:{rel_path}")
             return m, 0
         fn0, fn1 = _stmt_span(old_fn_root)
         m = self._lines_cov(rel_path, range(fn0, fn1 + 1))
         if m:
+            if self._trace:
+                self._note(f"fn_fallback:{rel_path}")
             return m, 0
         if cls_stack:
-            m = self._class_usage(self._cls_key(rel_path, cls_stack))
+            ck = self._cls_key(rel_path, cls_stack)
+            m = self._class_usage(ck)
             if m:
+                if self._trace:
+                    self._note(f"cls_usage:{ck}")
                 return m, 0
         return self._module_wide_fallback(rel_path, old_mod, include_importers=True)
 
@@ -1185,6 +1258,8 @@ class SelectorEngine:
         old_mod: Optional[ast.Module],
         old_lines: List[str],
         new_lines: List[str],
+        changed_classes: Optional[Set[str]] = None,
+        mod_change_flag: Optional[List[bool]] = None,
     ) -> Tuple[int, int]:
         """Diff Module or ClassDef body statement list, returning (base_mask, live_mask)."""
         base = 0
@@ -1194,6 +1269,14 @@ class SelectorEngine:
         sm = difflib.SequenceMatcher(None, osigs, nsigs, autojunk=False)
         old_counts = _count_target_assigns(old_stmts)
         new_counts = _count_target_assigns(new_stmts)
+        dec_enabled = self._rule_enabled("decorator_import_time")
+
+        def _mark_scope() -> None:
+            if cls_stack:
+                if changed_classes is not None:
+                    changed_classes.add(self._cls_key(rel_path, cls_stack))
+            elif mod_change_flag is not None:
+                mod_change_flag[0] = True
 
         for tag, i1, i2, j1, j2 in sm.get_opcodes():
             if tag == "equal":
@@ -1203,23 +1286,36 @@ class SelectorEngine:
                     if _node_same_fast(os_, ns_, old_lines, new_lines):
                         continue
                     if isinstance(os_, ast.ClassDef) and isinstance(ns_, ast.ClassDef):
+                        dec_diff = not _ast_list_eq(os_.decorator_list, ns_.decorator_list)
                         header_diff = (
                             not _ast_list_eq(os_.bases, ns_.bases)
                             or not _ast_list_eq(os_.keywords, ns_.keywords)
-                            or not _ast_list_eq(os_.decorator_list, ns_.decorator_list)
+                            or dec_diff
                         )
                         cls_stack.append(os_.name)
                         cls_key = self._cls_key(rel_path, cls_stack)
                         if header_diff:
-                            cm = self._class_usage(cls_key)
-                            if cm:
-                                base |= cm
-                            else:
-                                fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
-                                base |= fb
+                            if changed_classes is not None:
+                                changed_classes.add(cls_key)
+                            if dec_diff and dec_enabled:
+                                fb, fl = self._once_escalation(rel_path, old_mod)
+                                base |= self._class_usage(cls_key) | fb
                                 live |= fl
+                                if self._trace:
+                                    self._note(f"decorator:{rel_path}")
+                            else:
+                                cm = self._class_usage(cls_key)
+                                if cm:
+                                    base |= cm
+                                    if self._trace:
+                                        self._note(f"cls_usage:{cls_key}")
+                                else:
+                                    fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+                                    base |= fb
+                                    live |= fl
                         sb, sl = self._diff_scope_stmts(
-                            os_.body, ns_.body, rel_path, cls_stack, old_mod, old_lines, new_lines
+                            os_.body, ns_.body, rel_path, cls_stack, old_mod, old_lines, new_lines,
+                            changed_classes, mod_change_flag,
                         )
                         base |= sb
                         live |= sl
@@ -1227,9 +1323,19 @@ class SelectorEngine:
                     elif isinstance(os_, (ast.FunctionDef, ast.AsyncFunctionDef)) and isinstance(
                         ns_, (ast.FunctionDef, ast.AsyncFunctionDef)
                     ):
+                        if not _ast_eq(os_, ns_):
+                            _mark_scope()
                         s0, s1 = _stmt_span(os_)
                         fn_lines = range(s0, s1 + 1)
-                        if _fn_signature_changed(os_, ns_) or _fn_scope_shape(os_) != _fn_scope_shape(ns_):
+                        dec_diff = not _ast_list_eq(os_.decorator_list, ns_.decorator_list)
+                        if dec_diff and dec_enabled:
+                            cov = self._lines_cov(rel_path, fn_lines)
+                            fb, fl = self._once_escalation(rel_path, old_mod)
+                            base |= cov | fb
+                            live |= fl
+                            if self._trace:
+                                self._note(f"decorator:{rel_path}")
+                        elif _fn_signature_changed(os_, ns_) or _fn_scope_shape(os_) != _fn_scope_shape(ns_):
                             cov = self._lines_cov(rel_path, fn_lines)
                             if cov and self._touches_once_lines(rel_path, fn_lines, os_):
                                 fb, fl = self._once_escalation(rel_path, old_mod)
@@ -1237,10 +1343,15 @@ class SelectorEngine:
                                 live |= fl
                             elif cov:
                                 base |= cov
+                                if self._trace:
+                                    self._note(f"cov:{rel_path}")
                             elif cls_stack:
-                                cm = self._class_usage(self._cls_key(rel_path, cls_stack))
+                                ck = self._cls_key(rel_path, cls_stack)
+                                cm = self._class_usage(ck)
                                 if cm:
                                     base |= cm
+                                    if self._trace:
+                                        self._note(f"cls_usage:{ck}")
                                 else:
                                     fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
                                     base |= fb
@@ -1262,6 +1373,18 @@ class SelectorEngine:
                 ns_ = new_stmts[j1]
                 if _node_same_fast(os_, ns_, old_lines, new_lines):
                     continue
+                _mark_scope()
+                if (
+                    dec_enabled
+                    and isinstance(os_, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                    and isinstance(ns_, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                    and not _ast_list_eq(os_.decorator_list, ns_.decorator_list)
+                ):
+                    fb, fl = self._once_escalation(rel_path, old_mod)
+                    base |= fb
+                    live |= fl
+                    if self._trace:
+                        self._note(f"decorator:{rel_path}")
 
                 assigned_old = _extract_single_assign(os_)
                 assigned_new = _extract_single_assign(ns_)
@@ -1279,6 +1402,8 @@ class SelectorEngine:
                                 lam_mask |= self._lines_cov(rel_path, range(lam.lineno, (lam.end_lineno or lam.lineno) + 1))
                             if lam_mask:
                                 base |= lam_mask
+                                if self._trace:
+                                    self._note(f"cov:{rel_path}")
                                 continue
 
                         # 2) Tracked dict-key precision (when attr appears once in class and dict is tracked).
@@ -1297,13 +1422,20 @@ class SelectorEngine:
                                     cm = self._class_usage(cls_key)
                                     if cm:
                                         base |= cm
+                                        if self._trace:
+                                            self._note(f"cls_usage:{cls_key}")
                                     else:
                                         fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
                                         base |= fb
                                         live |= fl
                                 elif modified_existing:
+                                    dk_mask = 0
                                     for kn in modified_existing:
-                                        base |= self._dict_key_mask(attr, cls_key, kn)
+                                        dk_mask |= self._dict_key_mask(attr, cls_key, kn)
+                                    base |= dk_mask
+                                    if self._trace:
+                                        n_dk = dk_mask.bit_count()
+                                        self._note(f"dict_key_zero:{attr}" if n_dk == 0 else f"dict_key:{attr}:{n_dk}")
                                     # Confirmed tracked dict with potentially 0 readers: do not inflate!
                                     continue
                                 continue
@@ -1321,7 +1453,10 @@ class SelectorEngine:
                             cu = self._class_usage(cls_key)
                             readers = self._attr_reader_mask(attr)
                             if cu and readers:
-                                base |= cu & readers
+                                inter = cu & readers
+                                base |= inter
+                                if self._trace:
+                                    self._note(f"scalar_attr:{attr}:{inter.bit_count()}")
                                 continue
                     else:
                         # Top-level single assignment (Module scope):
@@ -1332,6 +1467,8 @@ class SelectorEngine:
                                 lam_mask |= self._lines_cov(rel_path, range(lam.lineno, (lam.end_lineno or lam.lineno) + 1))
                             if lam_mask:
                                 base |= lam_mask
+                                if self._trace:
+                                    self._note(f"cov:{rel_path}")
                                 continue
 
                         if (
@@ -1350,9 +1487,14 @@ class SelectorEngine:
                                 if not added_or_deleted and modified_existing and link_clss and all(
                                     lc in self.tracked_dict_classes for lc in link_clss
                                 ):
+                                    dk_mask = 0
                                     for lc in link_clss:
                                         for kn in modified_existing:
-                                            base |= self._dict_key_mask("EXPRESSION_METADATA", lc, kn)
+                                            dk_mask |= self._dict_key_mask("EXPRESSION_METADATA", lc, kn)
+                                    base |= dk_mask
+                                    if self._trace:
+                                        n_dk = dk_mask.bit_count()
+                                        self._note("dict_key_zero:EXPRESSION_METADATA" if n_dk == 0 else f"dict_key:EXPRESSION_METADATA:{n_dk}")
                                     continue
 
             # Filter pairwise AST-equal replacements before fallback!
@@ -1360,6 +1502,7 @@ class SelectorEngine:
                 if all(_node_same_fast(old_stmts[oi], new_stmts[nj], old_lines, new_lines) for oi, nj in zip(range(i1, i2), range(j1, j2))):
                     continue
 
+            _mark_scope()
             if cls_stack:
                 cls_key = self._cls_key(rel_path, cls_stack)
                 cm = self._class_usage(cls_key)
@@ -1370,6 +1513,11 @@ class SelectorEngine:
                 comb = cm | lm
                 if comb:
                     base |= comb
+                    if self._trace:
+                        if cm:
+                            self._note(f"cls_usage:{cls_key}")
+                        if lm:
+                            self._note(f"cov:{rel_path}")
                 else:
                     fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
                     base |= fb
@@ -1395,20 +1543,38 @@ class SelectorEngine:
         imp_live = self._importer_test_livemask(rel_path)
 
         if status == "deleted":
+            if self._trace:
+                self._note(f"deleted:{rel_path}")
+                self._note(f"test_file:{rel_path}")
             return 0, file_live | imp_live
 
         old_src, old_mod, old_lines = self._baseline_src_ast_lines(rel_path)
         new_src, ok = apply_hunks_in_memory(old_src, hunks)
         if not ok or old_mod is None:
+            if self._trace:
+                self._note(f"apply_fail:{rel_path}")
+                self._note(f"test_file:{rel_path}")
             return 0, file_live | imp_live
         try:
             new_mod = ast.parse(new_src)
         except SyntaxError:
+            if self._trace:
+                self._note(f"syntax:{rel_path}")
+                self._note(f"test_file:{rel_path}")
             return 0, file_live | imp_live
         if _encoding_cookie(old_src) != _encoding_cookie(new_src):
+            if self._trace:
+                self._note(f"syntax:{rel_path}")
+                self._note(f"test_file:{rel_path}")
             return 0, file_live | imp_live
         if _ast_eq(old_mod, new_mod):
-            return self._file_access(rel_path), 0
+            fa = self._file_access(rel_path)
+            if self._trace:
+                self._note(f"fixture:{rel_path}" if fa else f"inert:{rel_path}")
+            return fa, 0
+
+        if self._trace:
+            self._note(f"test_file:{rel_path}")
 
         new_lines = new_src.splitlines()
         base = self._file_access(rel_path)
@@ -1527,28 +1693,81 @@ class SelectorEngine:
         hunks: List[Dict[str, Any]],
         added_paths: Set[str],
         deleted_paths: Set[str],
+        raw_diff: str = "",
     ) -> Tuple[int, int]:
+        self._last_ast_eq = False
+        unc_enabled = self._rule_enabled("uncertainty_escalation")
+
         if status == "added":
-            return self._dir_walker_tests(rel_path) | self._pkg_walker_tests(rel_path), 0
+            bm = self._dir_walker_tests(rel_path) | self._pkg_walker_tests(rel_path)
+            lm = 0
+            if unc_enabled and rel_path.startswith("sqlglot/"):
+                pkg = rel_path.rsplit("/", 1)[0] if "/" in rel_path else ""
+                lm |= self._pkg_sibling_lazy_livemask(pkg)
+                if self._trace:
+                    self._note(f"uncertainty:{rel_path}")
+            if self._trace:
+                self._note(f"added:{rel_path}")
+            return bm, lm
 
         old_src, old_mod, old_lines = self._baseline_src_ast_lines(rel_path)
         if status == "deleted" or old_mod is None:
-            return self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+            fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+            if unc_enabled:
+                if rel_path.startswith("sqlglot/"):
+                    fl |= self._lazy_test_livemask(rel_path)
+                if (fb | fl) == 0 and rel_path.startswith("sqlglot/"):
+                    fl |= self.all_livemask
+                if self._trace:
+                    self._note(f"uncertainty:{rel_path}")
+            if self._trace:
+                self._note(f"deleted:{rel_path}" if status == "deleted" else f"uncertainty:{rel_path}")
+            return fb, fl
 
         new_src, ok = apply_hunks_in_memory(old_src, hunks)
         if not ok:
-            return self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+            if self._trace:
+                self._note(f"apply_fail:{rel_path}")
+            fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+            if unc_enabled:
+                fl |= self._lazy_test_livemask(rel_path)
+                if (fb | fl) == 0:
+                    fl |= self.all_livemask
+                if self._trace:
+                    self._note(f"uncertainty:{rel_path}")
+            return fb, fl
 
         try:
             new_mod = ast.parse(new_src)
         except SyntaxError:
-            return self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+            if self._trace:
+                self._note(f"syntax:{rel_path}")
+            fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+            if unc_enabled:
+                fl |= self._lazy_test_livemask(rel_path)
+                if (fb | fl) == 0:
+                    fl |= self.all_livemask
+                if self._trace:
+                    self._note(f"uncertainty:{rel_path}")
+            return fb, fl
 
         if _encoding_cookie(old_src) != _encoding_cookie(new_src):
-            return self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+            if self._trace:
+                self._note(f"syntax:{rel_path}")
+            fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+            if unc_enabled:
+                fl |= self._lazy_test_livemask(rel_path)
+                if (fb | fl) == 0:
+                    fl |= self.all_livemask
+                if self._trace:
+                    self._note(f"uncertainty:{rel_path}")
+            return fb, fl
 
         base = self._file_access(rel_path)
         if _ast_eq(old_mod, new_mod):
+            self._last_ast_eq = True
+            if self._trace:
+                self._note(f"fixture:{rel_path}" if base else f"inert:{rel_path}")
             return base, 0
 
         live = 0
@@ -1561,16 +1780,48 @@ class SelectorEngine:
             live |= fl
 
         new_lines = new_src.splitlines()
+        changed_classes: Set[str] = set()
+        mod_change_flag = [False]
         db, dl = self._diff_scope_stmts(
-            old_mod.body, new_mod.body, rel_path, [], old_mod, old_lines, new_lines
+            old_mod.body, new_mod.body, rel_path, [], old_mod, old_lines, new_lines,
+            changed_classes=changed_classes, mod_change_flag=mod_change_flag,
         )
-        return base | db, live | dl
+        tot_b = base | db
+        tot_l = live | dl
 
-    def select_commit(self, patch_text: str) -> Set[int]:
+        if rel_path.startswith("sqlglot/") and (tot_b | tot_l) == 0:
+            eb, el = 0, 0
+            if mod_change_flag[0] or not changed_classes:
+                eb, el = self._module_wide_fallback(rel_path, old_mod, include_importers=False)
+            else:
+                for ck in sorted(changed_classes):
+                    eb |= self._class_usage(ck)
+                if (eb | el) == 0:
+                    eb, el = self._module_wide_fallback(rel_path, old_mod, include_importers=False)
+            if eb or el:
+                self._empty_guard_pending[rel_path] = (eb, el, raw_diff)
+
+        return tot_b, tot_l
+
+    def select_commit(self, patch_text: str, apply_empty_guard: bool = True) -> Set[int]:
         """Select all potentially impacted test numbers for a single commit patch."""
+        self._trace = TRACE or (os.environ.get("BLAST_TRACE") == "1")
+        self.reasons = []
+        self._reason_seen = set()
+        self._empty_guard_pending = {}
+
         base_mask = 0
         live_mask = 0
         sections = parse_git_diff(patch_text)
+        self._last_num_sections = len(sections)
+        unc_enabled = self._rule_enabled("uncertainty_escalation")
+
+        if patch_text.strip() and not sections:
+            if unc_enabled:
+                live_mask |= self.all_livemask
+                if self._trace:
+                    self._note("uncertainty:unparseable_patch")
+            return self._decode_masks(base_mask, live_mask)
 
         added_paths: Set[str] = set()
         deleted_paths: Set[str] = set()
@@ -1594,23 +1845,58 @@ class SelectorEngine:
             b_path = sec["b_path"]
             status = sec["status"]
             hunks = sec["hunks"]
+            raw_diff = sec.get("raw_diff", "")
             is_rename = bool(sec.get("renamed") or (a_path and b_path and a_path != b_path))
 
             if not rel_path:
                 continue
 
-            if not rel_path.startswith(("sqlglot/", "tests/")):
+            fname = rel_path.rsplit("/", 1)[-1]
+            ext = ("." + fname.rsplit(".", 1)[-1].lower()) if "." in fname else ""
+            is_inert_path = (
+                ext in _INERT_EXTS or fname in _INERT_NAMES or rel_path.startswith(("docs/", ".github/"))
+            )
+            in_measured_tree = rel_path.startswith(("sqlglot/", "tests/"))
+
+            pm_hit = False
+            if not in_measured_tree and ext not in _INERT_EXTS:
                 # Repo files outside the measured trees (sqlglotc/setup.py, setup.py, ...): tests that name them.
                 for pth in {rel_path, a_path}:
                     if not pth:
                         continue
-                    fname = pth.rsplit("/", 1)[-1]
-                    ext = ("." + fname.rsplit(".", 1)[-1].lower()) if "." in fname else ""
-                    if ext in _INERT_EXTS:
-                        continue
                     for tf in self.path_mentions.get(pth.split("/", 1)[0], ()):
-                        live_mask |= self.file_to_livemask.get(tf, 0)
+                        m = self.file_to_livemask.get(tf, 0)
+                        if m:
+                            live_mask |= m
+                            pm_hit = True
+                if pm_hit and self._trace:
+                    self._note(f"path_mention:{rel_path}")
+
+            if sec.get("binary"):
+                if is_inert_path:
+                    if self._trace:
+                        self._note(f"inert:{rel_path}")
+                    continue
+                if unc_enabled:
+                    if rel_path.endswith(".py"):
+                        if rel_path in self.file_to_livemask:
+                            live_mask |= self.file_to_livemask[rel_path] | self._importer_test_livemask(rel_path)
+                        else:
+                            _, old_mod, _ = self._baseline_src_ast_lines(rel_path)
+                            fb, fl = self._once_escalation(rel_path, old_mod)
+                            if (fb | fl) == 0:
+                                fl |= self.all_livemask
+                            base_mask |= fb
+                            live_mask |= fl
+                    elif not pm_hit:
+                        live_mask |= self.all_livemask
+                    if self._trace:
+                        self._note(f"uncertainty:{rel_path}")
+                continue
+
             if is_rename and a_path and rel_path != a_path:
+                if self._trace:
+                    self._note("rename")
                 # Handle old path as deleted and new path as added.
                 if a_path.endswith(".py"):
                     if a_path in self.file_to_livemask:
@@ -1618,6 +1904,12 @@ class SelectorEngine:
                     else:
                         _, old_a_mod, _ = self._baseline_src_ast_lines(a_path)
                         fb, fl = self._module_wide_fallback(a_path, old_a_mod, include_importers=True)
+                        if unc_enabled and a_path.startswith("sqlglot/"):
+                            fl |= self._lazy_test_livemask(a_path)
+                            if (fb | fl) == 0:
+                                fl |= self.all_livemask
+                            if self._trace:
+                                self._note(f"uncertainty:{a_path}")
                         base_mask |= fb
                         live_mask |= fl
                 else:
@@ -1627,6 +1919,11 @@ class SelectorEngine:
                     base_mask |= self._dir_walker_tests(rel_path) | self._pkg_walker_tests(rel_path)
                     if rel_path in self.file_to_livemask:
                         live_mask |= self.file_to_livemask[rel_path]
+                    elif unc_enabled and rel_path.startswith("sqlglot/"):
+                        pkg = rel_path.rsplit("/", 1)[0] if "/" in rel_path else ""
+                        live_mask |= self._pkg_sibling_lazy_livemask(pkg)
+                        if self._trace:
+                            self._note(f"uncertainty:{rel_path}")
                 else:
                     base_mask |= self._file_access(rel_path) | self._dir_walker_tests(rel_path) | self._pkg_walker_tests(rel_path)
                 continue
@@ -1635,9 +1932,20 @@ class SelectorEngine:
                 if rel_path in self.file_to_livemask:
                     bm, lm = self._analyze_test_file(rel_path, status, hunks)
                 else:
-                    bm, lm = self._analyze_py_source(rel_path, status, hunks, added_paths, deleted_paths)
+                    bm, lm = self._analyze_py_source(rel_path, status, hunks, added_paths, deleted_paths, raw_diff)
                 base_mask |= bm
                 live_mask |= lm
+                if (
+                    not in_measured_tree
+                    and not is_inert_path
+                    and not pm_hit
+                    and not self._last_ast_eq
+                    and (bm | lm) == 0
+                    and unc_enabled
+                ):
+                    live_mask |= self.all_livemask
+                    if self._trace:
+                        self._note(f"uncertainty:{rel_path}")
             else:
                 acc = (
                     self._file_access(rel_path)
@@ -1647,6 +1955,8 @@ class SelectorEngine:
                 )
                 if acc:
                     base_mask |= acc
+                    if self._trace:
+                        self._note(f"fixture:{rel_path}")
                     continue
 
                 if rel_path.startswith("tests/"):
@@ -1657,15 +1967,33 @@ class SelectorEngine:
                             dir_hits |= self._to_mask(raw)
                     if dir_hits:
                         base_mask |= dir_hits
+                        if self._trace:
+                            self._note(f"fixture:{rel_path}")
                     else:
                         live_mask |= self.all_livemask
+                        if self._trace:
+                            self._note(f"uncertainty:{rel_path}")
                 else:
-                    fname = rel_path.rsplit("/", 1)[-1]
-                    ext = ("." + fname.rsplit(".", 1)[-1].lower()) if "." in fname else ""
-                    if ext in _INERT_EXTS or fname in _INERT_NAMES or rel_path.startswith(("docs/", ".github/")):
+                    if is_inert_path:
+                        if self._trace:
+                            self._note(f"inert:{rel_path}")
                         continue
                     if rel_path.startswith("sqlglot/"):
                         live_mask |= self.all_livemask
+                        if self._trace:
+                            self._note(f"uncertainty:{rel_path}")
+                    elif not pm_hit and unc_enabled:
+                        live_mask |= self.all_livemask
+                        if self._trace:
+                            self._note(f"uncertainty:{rel_path}")
+
+        if apply_empty_guard and self._empty_guard_pending and self._rule_enabled("empty_guard"):
+            for rp, (eb, el, _) in self._empty_guard_pending.items():
+                if eb or el:
+                    base_mask |= eb
+                    live_mask |= el
+                    if self._trace:
+                        self._note(f"empty_guard:{rp}")
 
         return self._decode_masks(base_mask, live_mask)
 
@@ -1797,20 +2125,108 @@ def load_maps(maps_path: Path) -> Dict[str, Any]:
     return json.loads(maps_path.read_text("utf-8"))
 
 
+def load_v1_engine(
+    tests_json: Dict[str, Any],
+    src_root: Path,
+    maps_path: Path = MAPS_V1_PATH,
+) -> Optional[Any]:
+    cur_dis = os.environ.get("BLAST_DISABLE", "")
+    cur_ena = os.environ.get("BLAST_ENABLE", "")
+    ena = {x.strip() for x in cur_ena.split(",") if x.strip()}
+    dis = (DEFAULT_DISABLED - ena) | {x.strip() for x in cur_dis.split(",") if x.strip()}
+    if cur_dis == _INIT_DISABLE_ENV and cur_ena == _INIT_ENABLE_ENV:
+        dis = DISABLED
+    if "union_v1" in dis:
+        return None
+    try:
+        here = str(Path(__file__).resolve().parent)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import selector_v1
+        maps_v1 = load_maps(maps_path)
+        return selector_v1.SelectorEngine(tests_json, maps_v1, src_root)
+    except Exception as exc:
+        print(f"[warn] union_v1 disabled: {exc}", file=sys.stderr)
+        return None
+
+
+def combine_selections(
+    v3_sel: Set[int],
+    v1_sel: Set[int],
+    v3_engine: Optional[SelectorEngine] = None,
+    v1_engine: Optional[Any] = None,
+) -> Set[int]:
+    """Union v3 and v1 selections, and apply empty_guard if both returned empty on a changed sqlglot file."""
+    out = set(v3_sel)
+    use_v1 = v3_engine._rule_enabled("union_v1") if v3_engine is not None else ("union_v1" not in DISABLED)
+    if use_v1 and v1_sel:
+        if v3_engine is not None and v3_engine._trace:
+            extra = len(v1_sel - out)
+            if extra:
+                v3_engine._note(f"union_v1:+{extra}")
+        out |= v1_sel
+    use_eg = v3_engine._rule_enabled("empty_guard") if v3_engine is not None else ("empty_guard" not in DISABLED)
+    if use_eg and v3_engine is not None and v3_engine._empty_guard_pending:
+        for rel_path, (eb, el, sec_patch) in v3_engine._empty_guard_pending.items():
+            v1_hit = False
+            if use_v1 and v1_sel:
+                if v1_engine is not None and v3_engine._last_num_sections > 1 and sec_patch:
+                    try:
+                        v1_hit = bool(v1_engine.select_commit(sec_patch))
+                    except Exception:
+                        v1_hit = True
+                else:
+                    v1_hit = True
+            if not v1_hit and (eb or el):
+                out |= v3_engine._decode_masks(eb, el)
+                if v3_engine._trace:
+                    v3_engine._note(f"empty_guard:{rel_path}")
+    return out
+
+
+def select_commit_v4(
+    v3_engine: SelectorEngine,
+    v1_engine: Optional[Any],
+    patch_text: str,
+) -> Set[int]:
+    """Run v3 + optional v1 union + empty_guard consistently across main() and offline evaluators."""
+    v3_sel = v3_engine.select_commit(patch_text, apply_empty_guard=False)
+    v1_sel: Set[int] = set()
+    if v1_engine is not None and v3_engine._rule_enabled("union_v1"):
+        try:
+            v1_sel = set(v1_engine.select_commit(patch_text))
+        except Exception as exc:
+            print(f"[warn] union_v1 select failed: {exc}", file=sys.stderr)
+            v1_sel = set()
+    return combine_selections(v3_sel, v1_sel, v3_engine=v3_engine, v1_engine=v1_engine)
+
+
 def main() -> None:
+    trace_on = TRACE or (os.environ.get("BLAST_TRACE") == "1")
     tests_json = json.loads((DATA_DIR / "tests.json").read_text("utf-8"))
     maps = load_maps(MAPS_PATH)
 
     engine = SelectorEngine(tests_json, maps, SQLGLOT_SRC)
+    v1_engine = load_v1_engine(tests_json, SQLGLOT_SRC)
     commits_dir = DATA_DIR / "commits"
     patch_files = sorted(commits_dir.glob("*.patch"))
 
     total_selected = 0
     for patch_path in patch_files:
         patch_text = patch_path.read_text("utf-8", errors="replace")
-        sel = engine.select_commit(patch_text)
+        sel = select_commit_v4(engine, v1_engine, patch_text)
         workers = pack_workers(sel, engine.num_to_ms)
         total_selected += len(sel)
+        if trace_on:
+            occ = [b for b in workers if b]
+            cost_ms = (max(sum(engine.num_to_ms[n] for n in b) for b in occ) + WORKER_COST_MS * len(occ)) if occ else 0
+            sys.stderr.write(
+                json.dumps(
+                    {"commit": patch_path.stem, "reasons": engine.reasons, "n": len(sel), "cost_ms": cost_ms},
+                    allow_nan=False,
+                )
+                + "\n"
+            )
         sys.stdout.write(json.dumps({"commit": patch_path.stem, "workers": workers}, allow_nan=False) + "\n")
     sys.stdout.flush()
     print(f"selected {total_selected} tests across {len(patch_files)} commits", file=sys.stderr)
