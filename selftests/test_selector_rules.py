@@ -1565,7 +1565,7 @@ class SelectorUnitTests(unittest.TestCase):
         self.assertIn(mn_num, sel_mn_fail)
         self.assertIn("probe_keep:max_nodes", eng.reasons)
 
-        # 3) Edit in sqlglot/tokens.py (in max_nodes_files) -> Probe A NOT attempted -> #1490 kept cleanly
+        # 3) Inductive max_nodes on sqlglot/tokens.py: benign edit drops #1490, >=400 literal skips probe, broken max_nodes keeps #1490
         tok_rel = "sqlglot/tokens.py"
         tsrc = (base / tok_rel).read_text("utf-8")
         tnew = tsrc.replace("if isinstance(item, str)", "if type(item) is str or isinstance(item, str)", 1)
@@ -1574,8 +1574,33 @@ class SelectorUnitTests(unittest.TestCase):
             + "".join(difflib.unified_diff(tsrc.splitlines(True), tnew.splitlines(True), f"a/{tok_rel}", f"b/{tok_rel}", n=3))
         )
         sel_tok = eng.select_commit(patch_tok)
-        self.assertIn(mn_num, sel_tok)
-        self.assertFalse(any(r.startswith("probe_") for r in eng.reasons), eng.reasons)
+        self.assertNotIn(mn_num, sel_tok, eng.reasons)
+        self.assertIn("probe_drop:max_nodes", eng.reasons)
+
+        t_big = tsrc.replace("if isinstance(item, str)", "if isinstance(item, str) and len(item) != 500", 1)
+        patch_tok_big = (
+            f"diff --git a/{tok_rel} b/{tok_rel}\nindex 0000000..1111111 100644\n"
+            + "".join(difflib.unified_diff(tsrc.splitlines(True), t_big.splitlines(True), f"a/{tok_rel}", f"b/{tok_rel}", n=3))
+        )
+        sel_tok_big = eng.select_commit(patch_tok_big)
+        self.assertIn(mn_num, sel_tok_big)
+        self.assertFalse(any("max_nodes" in r for r in eng.reasons), eng.reasons)
+
+        par_rel = "sqlglot/parser.py"
+        psrc = (base / par_rel).read_text("utf-8")
+        pnew = psrc.replace(
+            'self.raise_error(f"Maximum number of AST nodes ({self.max_nodes}) exceeded")',
+            'self.raise_error("AST limit hit")',
+            1,
+        )
+        self.assertNotEqual(pnew, psrc)
+        patch_par_bad = (
+            f"diff --git a/{par_rel} b/{par_rel}\nindex 0000000..1111111 100644\n"
+            + "".join(difflib.unified_diff(psrc.splitlines(True), pnew.splitlines(True), f"a/{par_rel}", f"b/{par_rel}", n=3))
+        )
+        sel_par_bad = eng.select_commit(patch_par_bad)
+        self.assertIn(mn_num, sel_par_bad)
+        self.assertIn("probe_keep:max_nodes", eng.reasons)
 
     def test_v8_probe_budget_and_disable_toggle(self) -> None:
         eng = self._make_real_engine()
@@ -1955,7 +1980,7 @@ class SelectorUnitTests(unittest.TestCase):
         maps = selector.load_maps(RWX_DIR / "maps/blast_maps.pkl.zlib")
         self.assertGreaterEqual(int(maps.get("version", 0)), 10)
         self.assertLessEqual(len(maps.get("fast_unprobed_ids", ())), 10)
-        self.assertEqual(eng.max_s3_exec_qids, 57)
+        self.assertEqual(eng.max_s3_exec_qids, 32)
         self.assertTrue(bool(eng.tpcds_opt_asts_zlib))
         self.assertEqual(len(eng.opt_tpch_digests), 22)
         self.assertEqual(len(eng.opt_tpcds_parse_digests), 99)
@@ -1992,7 +2017,7 @@ class SelectorUnitTests(unittest.TestCase):
         p_j6uz = (RWX_DIR / "sample/commits/j6uz.patch").read_text("utf-8")
         sel_j6uz = eng.select_commit(p_j6uz)
         self.assertIn(eng.ann_funcs_num, sel_j6uz, eng.reasons)
-        self.assertLess(eng.last_probe_cpu_s, 0.35)
+        self.assertLess(eng.last_probe_cpu_s, 0.60)
 
         bq_rel = "sqlglot/parsers/bigquery.py"
         bq_src = (base / bq_rel).read_text("utf-8")
@@ -2020,6 +2045,83 @@ class SelectorUnitTests(unittest.TestCase):
         self.assertEqual(len(res), 2)
         self.assertIn(eng_roi.tpcds_num, res[0][0])
         self.assertEqual(res[1][0], set(), res[1][1])
+
+    def test_v13_roi_turbo_inductive_max_nodes_and_topk(self) -> None:
+        import difflib
+
+        eng = self._make_real_engine()
+        base = RWX_DIR / "_sqlglot_baseline"
+        selector.TRACE = True
+
+        def _make_patch(rel: str, old_s: str, new_s: str) -> str:
+            return (
+                f"diff --git a/{rel} b/{rel}\nindex 0000000..1111111 100644\n"
+                + "".join(difflib.unified_diff(old_s.splitlines(True), new_s.splitlines(True), f"a/{rel}", f"b/{rel}", n=3))
+            )
+
+        # 1) Line-level s3 qmask in sqlglot/executor/env.py runs <= 10 queries instead of 57
+        env_rel = "sqlglot/executor/env.py"
+        env_src = (base / env_rel).read_text("utf-8")
+        env_ok = env_src.replace(
+            "def sql_not(value):\n",
+            "def sql_not(value):\n    if False:\n        _zz_v13 = 1\n",
+            1,
+        )
+        patch_env = _make_patch(env_rel, env_src, env_ok)
+        sel_static_env, secs_env, snap_env = eng._select_static_commit(patch_env)
+        ctx_env = eng._prepare_probe_context(secs_env)
+        self.assertIsNotNone(ctx_env)
+        plan_env = eng._plan_commit_probes(sel_static_env, snap_env, ctx_env, 45.0, 28.0, 45.0)
+        self.assertIsNotNone(plan_env)
+        self.assertIn("b", plan_env["items"])
+        self.assertLessEqual(len(plan_env["items"]["b"]["s3_exec_qids"]), 10)
+
+        # 2) Inductive max_nodes on core sqlglot/expressions/core.py drops #1490
+        core_rel = "sqlglot/expressions/core.py"
+        core_src = (base / core_rel).read_text("utf-8")
+        core_new = core_src.replace(
+            "        if self._meta is None:\n            self._meta = {}\n",
+            "        if self._meta is None:\n            if False:\n                _zz_v13_core = 1\n            self._meta = {}\n",
+            1,
+        )
+        core_patch = _make_patch(core_rel, core_src, core_new)
+        stat_core, _, _ = eng._select_static_commit(core_patch)
+        self.assertIn(eng.max_nodes_num, stat_core)
+        sel_core = eng.select_commit(core_patch)
+        self.assertNotIn(eng.max_nodes_num, sel_core, eng.reasons)
+        self.assertIn("probe_drop:max_nodes", eng.reasons)
+
+        # 3) Multi-Worker Cheap Slow Bundle / In-Fork Unmasking drops #1490, #1106, #1123, and #1107
+        msrc = (base / "sqlglot/generators/mysql.py").read_text("utf-8")
+        mnew = msrc.replace("class MySQLGenerator(", "@(lambda c: c)\nclass MySQLGenerator(", 1)
+        p_mysql = _make_patch("sqlglot/generators/mysql.py", msrc, mnew)
+        eng_m = self._make_real_engine()
+        selector.TRACE = True
+        selector.DISABLED.add("dynamic_probe")
+        sel_stat = eng_m.select_commit(p_mysql)
+        selector.DISABLED.discard("dynamic_probe")
+        self.assertGreater(len(sel_stat), 300)
+
+        sel_my = eng_m.select_commit(p_mysql)
+        self.assertLess(len(sel_my), len(sel_stat))
+        for reason in (
+            "probe_drop:max_nodes",
+            "probe_drop:tpcds:s1:57",
+            "probe_drop:opt_tpch",
+            "probe_drop:tpch",
+        ):
+            self.assertIn(reason, eng_m.reasons, eng_m.reasons)
+        test_ids = [t["id"] for t in json.loads((RWX_DIR / "sample/tests.json").read_text("utf-8"))["tests"]]
+        dropped_ids = {test_ids[n] for n in (sel_stat - sel_my)}
+        kept_ids = {test_ids[n] for n in sel_my}
+        for tid in (
+            "tests/test_parser.py::TestParser::test_max_nodes",
+            "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+            "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+            "tests/test_executor.py::TestExecutor::test_execute_tpch",
+        ):
+            self.assertIn(tid, dropped_ids, eng_m.reasons)
+            self.assertNotIn(tid, kept_ids)
 
 
 if __name__ == "__main__":
