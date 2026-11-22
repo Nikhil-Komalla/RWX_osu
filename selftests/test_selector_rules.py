@@ -1224,6 +1224,217 @@ class SelectorUnitTests(unittest.TestCase):
         selected = eng.select_commit(patch)
         self.assertEqual(selected, {1, 2})
 
+    def test_v7_module_new_fn_rule(self) -> None:
+        eng = _make_mini_engine()
+        src = "import sys\n\ndef existing(x):\n    return x\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src, ast.parse(src))
+
+        def _patch_append(fn_text: str) -> str:
+            return (
+                "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+                "--- a/sqlglot/mod_a.py\n"
+                "+++ b/sqlglot/mod_a.py\n"
+                "@@ -1,4 +1,7 @@\n"
+                " import sys\n"
+                " \n"
+                " def existing(x):\n"
+                "     return x\n"
+                + fn_text
+            )
+
+        # Fresh private top-level helper -> 0 tests
+        p_ok = _patch_append("+\n+def _zz_helper(x):\n+    return x\n")
+        self.assertEqual(eng.select_commit(p_ok), set())
+        selector.DISABLED.add("module_new_fn")
+        self.assertTrue(len(eng.select_commit(p_ok)) > 0)
+        selector.DISABLED.discard("module_new_fn")
+
+        # Negatives: existing name, builtin, decorated, call default
+        for bad_fn in (
+            "+\n+def existing(x):\n+    return 2\n",
+            "+\n+def len(x):\n+    return 0\n",
+            "+@my_dec\n+def _zz_helper(x):\n+    return x\n",
+            "+\n+def _zz_helper(x=foo()):\n+    return x\n",
+        ):
+            self.assertTrue(len(eng.select_commit(_patch_append(bad_fn))) > 0, bad_fn)
+
+    def test_v7_noop_stdlib_import_rule(self) -> None:
+        eng = _make_mini_engine()
+        src = "import re\nimport sys\nfrom sqlglot import mod_b\n\nX = 1\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src, ast.parse(src))
+
+        p_add = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -1,3 +1,4 @@\n"
+            "+import heapq\n"
+            " import re\n"
+            " import sys\n"
+            " from sqlglot import mod_b\n"
+        )
+        self.assertEqual(eng.select_commit(p_add), set())
+        selector.DISABLED.add("noop_stdlib_import")
+        self.assertTrue(len(eng.select_commit(p_add)) > 0)
+        selector.DISABLED.discard("noop_stdlib_import")
+
+        p_local_add = p_add.replace("+import heapq", "+from sqlglot.mod_b import X")
+        self.assertTrue(len(eng.select_commit(p_local_add)) > 0)
+
+        src_pure = "import re\nimport sys\n\nX = 1\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src_pure, ast.parse(src_pure))
+        p_swap_std = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            "-import re\n"
+            " import sys\n"
+            "+import re\n"
+            " \n"
+        )
+        self.assertEqual(eng.select_commit(p_swap_std), set())
+
+        src_sg = "from sqlglot import a\nfrom sqlglot import b\n\nX = 1\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src_sg, ast.parse(src_sg))
+        p_swap_sg = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            "-from sqlglot import a\n"
+            " from sqlglot import b\n"
+            "+from sqlglot import a\n"
+            " \n"
+        )
+        self.assertTrue(len(eng.select_commit(p_swap_sg)) > 0)
+
+    def test_v7_module_const_narrow_rule(self) -> None:
+        eng = _make_mini_engine()
+        lines = [
+            "LIMIT = 5",
+            "",
+            "",
+            "",
+            "def f0():",
+            "    return 1",
+            "",
+            "",
+            "def f_limit():",
+            "    return LIMIT",  # line 10 -> covered only by test 1
+        ]
+        src = "\n".join(lines) + "\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src, ast.parse(src))
+        p_const = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            "-LIMIT = 5\n"
+            "+LIMIT = 6\n"
+            " \n"
+        )
+        self.assertEqual(eng.select_commit(p_const), {1})
+        selector.DISABLED.add("module_const_narrow")
+        self.assertEqual(eng.select_commit(p_const), {0, 1, 2})
+        selector.DISABLED.discard("module_const_narrow")
+
+        # Read at module level -> fallback ({0, 1, 2})
+        src_mod = "\n".join(["LIMIT = 5", "OTHER = LIMIT + 1"] + lines[2:]) + "\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src_mod, ast.parse(src_mod))
+        self.assertEqual(eng.select_commit(p_const), {0, 1, 2})
+
+        # Quoted string mention -> fallback ({0, 1, 2})
+        src_q = "\n".join(["LIMIT = 5", "NAME = 'LIMIT'"] + lines[2:]) + "\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src_q, ast.parse(src_q))
+        self.assertEqual(eng.select_commit(p_const), {0, 1, 2})
+
+    def test_v7_class_new_method_rule(self) -> None:
+        eng = _make_mini_engine()
+        src = "class Widget:\n    def existing(self):\n        return 1\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src, ast.parse(src))
+        eng.known_words = frozenset({"helper_m"})
+
+        def _patch_method(m_name: str) -> str:
+            return (
+                "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+                "--- a/sqlglot/mod_a.py\n"
+                "+++ b/sqlglot/mod_a.py\n"
+                "@@ -1,3 +1,6 @@\n"
+                " class Widget:\n"
+                "     def existing(self):\n"
+                "         return 1\n"
+                "+\n"
+                f"+    def {m_name}(self):\n"
+                "+        return 2\n"
+            )
+
+        p_ok = _patch_method("_zz_m")
+        self.assertEqual(eng.select_commit(p_ok), set())
+        selector.DISABLED.add("class_new_method")
+        self.assertTrue(len(eng.select_commit(p_ok)) > 0)
+        selector.DISABLED.discard("class_new_method")
+
+        self.assertTrue(len(eng.select_commit(_patch_method("foo_sql"))) > 0)
+        self.assertTrue(len(eng.select_commit(_patch_method("helper_m"))) > 0)
+
+    def test_v7_notop_and_fstring_noop(self) -> None:
+        for old_e, new_e in [("not x in y", "x not in y"), ("not x is y", "x is not y")]:
+            ctx = selector._SemEqCtx()
+            ok = selector._sem_eq(
+                ast.parse(f"def f(x, y):\n    return {old_e}\n"),
+                ast.parse(f"def f(x, y):\n    return {new_e}\n"),
+                ctx,
+            )
+            self.assertTrue(ok)
+            self.assertEqual(ctx.kinds, {"notop"})
+
+        ctx1 = selector._SemEqCtx()
+        self.assertTrue(
+            selector._sem_eq(
+                ast.parse('def f():\n    return f"abc"\n'),
+                ast.parse('def f():\n    return "abc"\n'),
+                ctx1,
+            )
+        )
+        self.assertEqual(ctx1.kinds, {"fstring"})
+
+        ctx2 = selector._SemEqCtx()
+        self.assertFalse(
+            selector._sem_eq(
+                ast.parse('def f():\n    f"""d"""\n    return 1\n'),
+                ast.parse('def f():\n    """d"""\n    return 1\n'),
+                ctx2,
+            )
+        )
+        ctx3 = selector._SemEqCtx()
+        self.assertFalse(
+            selector._sem_eq(
+                ast.parse('def f(x):\n    return f"{x}"\n'),
+                ast.parse('def f(x):\n    return "x"\n'),
+                ctx3,
+            )
+        )
+
+        # End-to-end toggle check on noop_fstring
+        eng = _make_mini_engine()
+        lines = [""] * 8 + ["def f():", '    return "abc"']  # line 10 covered by test {1}
+        src = "\n".join(lines) + "\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src, ast.parse(src))
+        p_fstr = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -9,2 +9,2 @@\n"
+            " def f():\n"
+            '-    return "abc"\n'
+            '+    return f"abc"\n'
+        )
+        self.assertEqual(eng.select_commit(p_fstr), set())
+        selector.DISABLED.add("noop_fstring")
+        self.assertEqual(eng.select_commit(p_fstr), {1})
+        selector.DISABLED.discard("noop_fstring")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

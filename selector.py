@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import ast
+import builtins
+import copy
 import difflib
+import enum
 import gzip
 import json
 import math
@@ -343,6 +346,7 @@ class _SemEqCtx:
         "allow_ann",
         "allow_notop",
         "allow_tc",
+        "allow_fstr",
         "future_ann",
         "has_from_tc",
         "typing_aliases",
@@ -361,6 +365,7 @@ class _SemEqCtx:
         allow_ann: bool = True,
         allow_notop: bool = True,
         allow_tc: bool = True,
+        allow_fstr: bool = True,
         future_ann: bool = False,
         has_from_tc: bool = False,
         typing_aliases: FrozenSet[str] = frozenset(),
@@ -373,6 +378,7 @@ class _SemEqCtx:
         self.allow_ann = allow_ann
         self.allow_notop = allow_notop
         self.allow_tc = allow_tc
+        self.allow_fstr = allow_fstr
         self.future_ann = future_ann
         self.has_from_tc = has_from_tc
         self.typing_aliases = typing_aliases
@@ -448,6 +454,14 @@ def _sem_eq(a: Any, b: Any, ctx: _SemEqCtx) -> bool:
                         ctx.kinds.add("notop")
                         return True
                     return False
+
+    if ctx.allow_fstr and type(a) is not type(b):
+        sa = _plain_fstr_value(a)
+        if sa is not None:
+            sb = _plain_fstr_value(b)
+            if sb is not None and sa == sb:
+                ctx.kinds.add("fstring")
+                return True
 
     if type(a) is not type(b):
         return False
@@ -614,6 +628,12 @@ def _sem_eq(a: Any, b: Any, ctx: _SemEqCtx) -> bool:
             return True
 
     if isinstance(a, ast.AST):
+        if isinstance(a, ast.Expr) and isinstance(b, ast.Expr):
+            va, vb = a.value, b.value
+            if (isinstance(va, ast.Constant) and isinstance(va.value, str) and isinstance(vb, ast.JoinedStr)) or (
+                isinstance(vb, ast.Constant) and isinstance(vb.value, str) and isinstance(va, ast.JoinedStr)
+            ):
+                return False
         fields = a._fields
         if fields != b._fields:
             return False
@@ -945,6 +965,164 @@ def _is_simple_scalar_ast(node: ast.AST) -> bool:
     return False
 
 
+_BUILTIN_NAMES = frozenset(dir(builtins))
+_BASE_ATTR_NAMES = frozenset().union(
+    *(
+        dir(t)
+        for t in (
+            object,
+            int,
+            str,
+            bytes,
+            dict,
+            list,
+            tuple,
+            set,
+            frozenset,
+            type,
+            Exception,
+            enum.Enum,
+            enum.IntEnum,
+        )
+    )
+)
+_SAFE_STDLIB = frozenset({
+    "abc",
+    "array",
+    "ast",
+    "base64",
+    "binascii",
+    "bisect",
+    "calendar",
+    "codecs",
+    "collections",
+    "contextlib",
+    "copy",
+    "csv",
+    "dataclasses",
+    "datetime",
+    "decimal",
+    "difflib",
+    "enum",
+    "fnmatch",
+    "fractions",
+    "functools",
+    "glob",
+    "gzip",
+    "hashlib",
+    "heapq",
+    "inspect",
+    "io",
+    "itertools",
+    "json",
+    "keyword",
+    "locale",
+    "logging",
+    "math",
+    "numbers",
+    "operator",
+    "os",
+    "pathlib",
+    "pickle",
+    "pprint",
+    "queue",
+    "random",
+    "re",
+    "shlex",
+    "statistics",
+    "string",
+    "struct",
+    "sys",
+    "tempfile",
+    "textwrap",
+    "threading",
+    "time",
+    "traceback",
+    "types",
+    "typing",
+    "unicodedata",
+    "uuid",
+    "warnings",
+    "weakref",
+    "zlib",
+    "zoneinfo",
+})
+_DYN_MARKERS = (
+    "globals()",
+    "__getattr__",
+    "getmembers(",
+    "vars(",
+    "__dict__",
+    "sys.modules[__name__]",
+    "__all__",
+)
+_WORD_RE = re.compile(r"\w+")
+
+
+def _is_pure_literal(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Not, ast.Invert)):
+        return _is_pure_literal(node.operand)
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(_is_pure_literal(e) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(k is not None and _is_pure_literal(k) for k in node.keys) and all(
+            _is_pure_literal(v) for v in node.values
+        )
+    return False
+
+
+def _deftime_safe(fn: ast.AST, future_ann: bool) -> bool:
+    if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    if fn.decorator_list or getattr(fn, "type_params", []):
+        return False
+    args = fn.args
+    for d in args.defaults:
+        if not _is_pure_literal(d):
+            return False
+    for d in args.kw_defaults:
+        if d is not None and not _is_pure_literal(d):
+            return False
+    if not future_ann:
+        for grp in (args.posonlyargs, args.args, args.kwonlyargs):
+            for a in grp:
+                if a.annotation is not None:
+                    return False
+        for a in (args.vararg, args.kwarg):
+            if a is not None and a.annotation is not None:
+                return False
+        if fn.returns is not None:
+            return False
+    return True
+
+
+def _plain_fstr_value(node: Any) -> Optional[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        parts: List[str] = []
+        for v in node.values:
+            if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                parts.append(v.value)
+            else:
+                return None
+        return "".join(parts)
+    return None
+
+
+def _bound_import_names(st: ast.stmt) -> List[str]:
+    out: List[str] = []
+    if isinstance(st, ast.Import):
+        for alias in st.names:
+            out.append(alias.asname or alias.name.split(".", 1)[0])
+    elif isinstance(st, ast.ImportFrom):
+        for alias in st.names:
+            out.append(alias.asname or alias.name)
+    return out
+
+
 def _extract_single_assign(stmt: ast.stmt) -> Optional[Tuple[str, ast.AST]]:
     if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
         return stmt.targets[0].id, stmt.value
@@ -1268,6 +1446,10 @@ class SelectorEngine:
         self._once_cache: Dict[Tuple[bool, str], frozenset] = {}
         self._pkg_lazy_cache: Dict[str, int] = {}
         self._mod_users_cache: Dict[str, Tuple[int, int]] = {}
+        self.direct_imports: Dict[str, List[str]] = maps.get("imports", {})
+        self._inv_imports: Optional[Dict[str, List[str]]] = None
+        self._star_imported: Optional[FrozenSet[str]] = None
+        self._src_text_cache: Dict[str, str] = {}
         self._marks: int = 0
         self._trusted_marks: int = 0
         self._other_added_text: str = ""
@@ -1934,6 +2116,564 @@ class SelectorEngine:
             self._note(f"decorator_narrow:{rel_path}")
         return cov | itb, itl
 
+    def _get_subprocess_livemask(self) -> int:
+        if self._subprocess_livemask is None:
+            m = 0
+            for tid in self.subprocess_test_ids:
+                num = self.id_to_num.get(tid)
+                if num is not None:
+                    m |= 1 << num
+            self._subprocess_livemask = m
+        return self._subprocess_livemask
+
+    def _read_src(self, rel_path: str) -> str:
+        cached = self._src_text_cache.get(rel_path)
+        if cached is not None:
+            return cached
+        if rel_path in self._ast_cache:
+            src = self._ast_cache[rel_path][0]
+            self._src_text_cache[rel_path] = src
+            return src
+        p = self.src_root / rel_path
+        try:
+            src = p.read_text("utf-8", errors="replace") if p.is_file() else ""
+        except OSError:
+            src = ""
+        self._src_text_cache[rel_path] = src
+        return src
+
+    def _star_imported_paths(self) -> FrozenSet[str]:
+        if self._star_imported is not None:
+            return self._star_imported
+        star_targets: Set[str] = set()
+        star_edges: Dict[str, Set[str]] = defaultdict(set)
+        sqlglot_dir = self.src_root / "sqlglot"
+        if sqlglot_dir.is_dir():
+            for p in sorted(sqlglot_dir.rglob("*.py")):
+                if "__pycache__" in p.parts:
+                    continue
+                rel = p.relative_to(self.src_root).as_posix()
+                src = self._read_src(rel)
+                if "import *" not in src:
+                    continue
+                try:
+                    mod = ast.parse(src)
+                except SyntaxError:
+                    continue
+                for st in ast.walk(mod):
+                    if isinstance(st, ast.ImportFrom) and any(a.name == "*" for a in st.names):
+                        res = _resolve_local_mod_path(
+                            st.module or "", st.level, rel, self.src_root, set(), set()
+                        )
+                        if res is not None and res != "__MISSING__":
+                            star_targets.add(res)
+                            star_edges[rel].add(res)
+        work = list(star_targets)
+        while work:
+            cur = work.pop()
+            for nxt in star_edges.get(cur, ()):
+                if nxt not in star_targets:
+                    star_targets.add(nxt)
+                    work.append(nxt)
+        self._star_imported = frozenset(star_targets)
+        return self._star_imported
+
+    def _importers_of(self, rel_path: str) -> List[str]:
+        if self._inv_imports is None:
+            inv: Dict[str, Set[str]] = defaultdict(set)
+            for imp_by, targets in self.direct_imports.items():
+                for tgt in targets:
+                    inv[tgt].add(imp_by)
+            self._inv_imports = {k: sorted(v) for k, v in inv.items()}
+        return self._inv_imports.get(rel_path, [])
+
+    def _name_in_direct_importers(self, rel_path: str, name: str) -> bool:
+        pat = re.compile(rf"\b{re.escape(name)}\b")
+        for f in self._importers_of(rel_path):
+            if pat.search(self._read_src(f)):
+                return True
+        return False
+
+    def _neutral_filter(
+        self,
+        rel_path: str,
+        old_src: str,
+        old_mod: ast.Module,
+        new_mod: ast.Module,
+        old_lines: Optional[List[str]] = None,
+        new_lines: Optional[List[str]] = None,
+    ) -> Tuple[List[ast.stmt], Set[str]]:
+        if not rel_path.startswith("sqlglot/"):
+            return list(new_mod.body), set()
+
+        en_fn = self._rule_enabled("module_new_fn")
+        en_imp = self._rule_enabled("noop_stdlib_import")
+        en_cls = self._rule_enabled("class_new_method")
+        if not (en_fn or en_imp or en_cls):
+            return list(new_mod.body), set()
+
+        _old_tok_cache: Optional[Set[str]] = None
+
+        def _get_old_tokens() -> Set[str]:
+            nonlocal _old_tok_cache
+            if _old_tok_cache is None:
+                _old_tok_cache = set(_WORD_RE.findall(old_src))
+            return _old_tok_cache
+
+        future: Optional[bool] = None
+
+        def _is_future() -> bool:
+            nonlocal future
+            if future is None:
+                future = _has_future_annotations(old_mod) and _has_future_annotations(new_mod)
+            return future
+
+        module_ok = (not rel_path.endswith("__init__.py") and not any(m in old_src for m in _DYN_MARKERS)) if (en_fn or en_imp) else False
+        body: List[ast.stmt] = list(new_mod.body)
+        kinds: Set[str] = set()
+
+        # (a) Fresh undecorated top-level helper functions
+        if en_fn and module_ok:
+            old_top = _top_level_names(old_mod.body)
+            has_cand_fn = any(
+                isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.name not in old_top
+                for st in body
+            )
+            if has_cand_fn:
+                old_tokens = _get_old_tokens()
+                new_bind_counts: Dict[str, int] = Counter()
+                for st in body:
+                    for bn in _top_level_names([st]):
+                        new_bind_counts[bn] += 1
+                filtered_a: List[ast.stmt] = []
+                for st in body:
+                    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        n = st.name
+                        if (
+                            n not in old_top
+                            and n not in old_tokens
+                            and n not in _BUILTIN_NAMES
+                            and not (n.startswith("__") and n.endswith("__"))
+                            and _deftime_safe(st, _is_future())
+                            and new_bind_counts.get(n, 0) == 1
+                            and ((n not in self.known_words) or (n.startswith("_") and not self._name_in_direct_importers(rel_path, n)))
+                            and (n.startswith("_") or rel_path not in self._star_imported_paths())
+                        ):
+                            kinds.add("module_new_fn")
+                            if self._trace:
+                                self._note(f"module_new_fn:{rel_path}:{n}")
+                            continue
+                    filtered_a.append(st)
+                body = filtered_a
+
+        # (b) Pure stdlib import additions and import reorders
+        if en_imp and module_ok:
+            def _is_nonfuture_imp(st: ast.stmt) -> bool:
+                return isinstance(st, ast.Import) or (isinstance(st, ast.ImportFrom) and st.module != "__future__")
+
+            old_imps = [st for st in old_mod.body if _is_nonfuture_imp(st)]
+            new_imps = [st for st in body if _is_nonfuture_imp(st)]
+            imps_unchanged = (
+                old_lines is not None
+                and new_lines is not None
+                and len(old_imps) == len(new_imps)
+                and all(
+                    old_lines[a.lineno - 1 : (a.end_lineno or a.lineno)]
+                    == new_lines[b.lineno - 1 : (b.end_lineno or b.lineno)]
+                    for a, b in zip(old_imps, new_imps)
+                )
+            )
+            if not imps_unchanged:
+                def _is_safe_stdlib_mod(st: ast.stmt) -> bool:
+                    if isinstance(st, ast.Import):
+                        return all(a.name != "*" and a.name.split(".", 1)[0] in _SAFE_STDLIB for a in st.names)
+                    if isinstance(st, ast.ImportFrom):
+                        return (
+                            st.level == 0
+                            and bool(st.module)
+                            and (st.module or "").split(".", 1)[0] in _SAFE_STDLIB
+                            and all(a.name != "*" for a in st.names)
+                        )
+                    return False
+
+                old_tokens = _get_old_tokens()
+                old_imp_rem = Counter(
+                    ast.dump(st, include_attributes=False) for st in old_imps
+                )
+                added_idxs: List[int] = []
+                all_added_safe = True
+                for idx, st in enumerate(body):
+                    if not _is_nonfuture_imp(st):
+                        continue
+                    d = ast.dump(st, include_attributes=False)
+                    if old_imp_rem[d] > 0:
+                        old_imp_rem[d] -= 1
+                    else:
+                        added_idxs.append(idx)
+                        if not _is_safe_stdlib_mod(st):
+                            all_added_safe = False
+                            continue
+                        for bn in _bound_import_names(st):
+                            if (
+                                bn in old_tokens
+                                or bn in _BUILTIN_NAMES
+                                or (bn.startswith("__") and bn.endswith("__"))
+                                or (not bn.startswith("_") and rel_path in self._star_imported_paths())
+                            ):
+                                all_added_safe = False
+                                break
+                if added_idxs and all_added_safe:
+                    drop_set = set(added_idxs)
+                    body = [st for idx, st in enumerate(body) if idx not in drop_set]
+                    kinds.add("stdlib_import_add")
+
+                def _split_runs(stmts: Sequence[ast.stmt]) -> Tuple[List[List[ast.stmt]], List[Tuple[bool, List[ast.stmt]]]]:
+                    runs: List[List[ast.stmt]] = []
+                    segs: List[Tuple[bool, List[ast.stmt]]] = []
+                    cur_i: List[ast.stmt] = []
+                    cur_o: List[ast.stmt] = []
+                    for s in stmts:
+                        if _is_nonfuture_imp(s):
+                            if cur_o:
+                                segs.append((False, cur_o))
+                                cur_o = []
+                            cur_i.append(s)
+                        else:
+                            if cur_i:
+                                runs.append(cur_i)
+                                segs.append((True, cur_i))
+                                cur_i = []
+                            cur_o.append(s)
+                    if cur_i:
+                        runs.append(cur_i)
+                        segs.append((True, cur_i))
+                    if cur_o:
+                        segs.append((False, cur_o))
+                    return runs, segs
+
+                old_runs, _ = _split_runs(old_mod.body)
+                new_runs, new_segs = _split_runs(body)
+                if len(old_runs) == len(new_runs) and old_runs:
+                    old_dumps_list = [[ast.dump(s, include_attributes=False) for s in r] for r in old_runs]
+                    new_dumps_list = [[ast.dump(s, include_attributes=False) for s in r] for r in new_runs]
+                    if all(Counter(od) == Counter(nd) for od, nd in zip(old_dumps_list, new_dumps_list)):
+                        diff_idxs = {k for k, (od, nd) in enumerate(zip(old_dumps_list, new_dumps_list)) if od != nd}
+                        if diff_idxs and all(_is_safe_stdlib_mod(s) for k in diff_idxs for s in new_runs[k]):
+                            from collections import deque
+                            rebuilt: List[ast.stmt] = []
+                            r_idx = 0
+                            for is_imp, seg in new_segs:
+                                if not is_imp:
+                                    rebuilt.extend(seg)
+                                    continue
+                                if r_idx in diff_idxs:
+                                    by_dump: Dict[str, deque] = defaultdict(deque)
+                                    for s, sd in zip(seg, new_dumps_list[r_idx]):
+                                        by_dump[sd].append(s)
+                                    for od in old_dumps_list[r_idx]:
+                                        rebuilt.append(by_dump[od].popleft())
+                                else:
+                                    rebuilt.extend(seg)
+                                r_idx += 1
+                            body = rebuilt
+                            kinds.add("import_reorder")
+
+        # (c) Fresh non-overriding undecorated class methods
+        if en_cls:
+            def _cls_bound_targets(stmts: Sequence[ast.stmt]) -> Set[str]:
+                out: Set[str] = set()
+                def _collect_tgt(t: ast.AST) -> None:
+                    if isinstance(t, ast.Name):
+                        out.add(t.id)
+                    elif isinstance(t, (ast.Tuple, ast.List)):
+                        for e in t.elts:
+                            _collect_tgt(e)
+                    elif isinstance(t, ast.Starred):
+                        _collect_tgt(t.value)
+                for s in stmts:
+                    if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        out.add(s.name)
+                    elif isinstance(s, ast.Assign):
+                        for t in s.targets:
+                            _collect_tgt(t)
+                    elif isinstance(s, ast.AnnAssign):
+                        _collect_tgt(s.target)
+                return out
+
+            def _cls_bind_counts(stmts: Sequence[ast.stmt]) -> Dict[str, int]:
+                counts: Dict[str, int] = Counter()
+                for s in stmts:
+                    for bn in _cls_bound_targets([s]):
+                        counts[bn] += 1
+                return counts
+
+            def _filter_cls_body(
+                cur_old: Sequence[ast.stmt],
+                cur_new: Sequence[ast.stmt],
+                cls_stack: List[str],
+            ) -> Tuple[List[ast.stmt], bool]:
+                old_by_name: Dict[str, List[ast.ClassDef]] = defaultdict(list)
+                new_by_name: Dict[str, List[ast.ClassDef]] = defaultdict(list)
+                for s in cur_old:
+                    if isinstance(s, ast.ClassDef):
+                        old_by_name[s.name].append(s)
+                for s in cur_new:
+                    if isinstance(s, ast.ClassDef):
+                        new_by_name[s.name].append(s)
+
+                out_stmts: List[ast.stmt] = []
+                changed = False
+                for s in cur_new:
+                    if isinstance(s, ast.ClassDef):
+                        oc_list = old_by_name.get(s.name, ())
+                        nc_list = new_by_name.get(s.name, ())
+                        if len(oc_list) == 1 and len(nc_list) == 1:
+                            oc = oc_list[0]
+                            if (
+                                old_lines is not None
+                                and new_lines is not None
+                                and ((oc.end_lineno or oc.lineno) - oc.lineno) == ((s.end_lineno or s.lineno) - s.lineno)
+                                and old_lines[oc.lineno - 1 : (oc.end_lineno or oc.lineno)]
+                                == new_lines[s.lineno - 1 : (s.end_lineno or s.lineno)]
+                            ):
+                                out_stmts.append(s)
+                                continue
+                            if (
+                                _ast_list_eq(oc.bases, s.bases)
+                                and _ast_list_eq(oc.keywords, s.keywords)
+                                and _ast_list_eq(oc.decorator_list, s.decorator_list)
+                            ):
+                                sub_stk = cls_stack + [s.name]
+                                sub_body, sub_changed = _filter_cls_body(oc.body, s.body, sub_stk)
+                                ob = _cls_bound_targets(oc.body)
+                                has_cand_m = any(
+                                    isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                    and m.name not in ob
+                                    and not (m.name.startswith("__") and m.name.endswith("__"))
+                                    and m.name not in self.known_words
+                                    and m.name not in _BASE_ATTR_NAMES
+                                    and not m.name.endswith(("_sql", "_parser", "_parsers"))
+                                    and not m.name.startswith("test")
+                                    for m in sub_body
+                                )
+                                if has_cand_m:
+                                    old_tokens = _get_old_tokens()
+                                    nb_counts = _cls_bind_counts(s.body)
+                                    fut = _is_future()
+                                    filtered_cls: List[ast.stmt] = []
+                                    dropped = False
+                                    for m in sub_body:
+                                        if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                            mn = m.name
+                                            if (
+                                                mn not in ob
+                                                and not (mn.startswith("__") and mn.endswith("__"))
+                                                and _deftime_safe(m, fut)
+                                                and mn not in self.known_words
+                                                and mn not in old_tokens
+                                                and mn not in _BASE_ATTR_NAMES
+                                                and not mn.endswith(("_sql", "_parser", "_parsers"))
+                                                and not mn.startswith("test")
+                                                and nb_counts.get(mn, 0) == 1
+                                            ):
+                                                dropped = True
+                                                kinds.add("class_new_method")
+                                                if self._trace:
+                                                    self._note(f"class_new_method:{rel_path}::{'.'.join(sub_stk)}.{mn}")
+                                                continue
+                                        filtered_cls.append(m)
+                                else:
+                                    filtered_cls = sub_body
+                                    dropped = False
+                                if dropped or sub_changed:
+                                    c2 = copy.copy(s)
+                                    c2.body = filtered_cls
+                                    out_stmts.append(c2)
+                                    changed = True
+                                    continue
+                    out_stmts.append(s)
+                return out_stmts, changed
+
+            body, _ = _filter_cls_body(old_mod.body, body, [])
+
+        return body, kinds
+
+    def _module_const_readers(
+        self,
+        rel_path: str,
+        name: str,
+        old_mod: ast.Module,
+        old_src: str,
+        assign_lineno: int,
+    ) -> Optional[Tuple[int, int]]:
+        if not self._rule_enabled("module_const_narrow"):
+            return None
+        if not rel_path.startswith("sqlglot/") or rel_path.endswith("__init__.py"):
+            return None
+        if any(m in old_src for m in _DYN_MARKERS):
+            return None
+        if name.startswith("__") and name.endswith("__"):
+            return None
+        quoted_re = re.compile(rf"['\"]{re.escape(name)}['\"]")
+        if quoted_re.search(old_src) or f"global {name}" in old_src:
+            return None
+        if not name.startswith("_") and rel_path in self._star_imported_paths():
+            return None
+
+        def _ref_sites(
+            root: ast.AST,
+            ignore_imports: bool,
+        ) -> Optional[List[Tuple[Any, bool, Optional[ast.stmt], ast.AST]]]:
+            sites: List[Tuple[Any, bool, Optional[ast.stmt], ast.AST]] = []
+            stmt_stack: List[ast.stmt] = []
+
+            def _visit(node: Any, in_fn: bool) -> bool:
+                if node is None:
+                    return True
+                if isinstance(node, list):
+                    for it in node:
+                        if not _visit(it, in_fn):
+                            return False
+                    return True
+                if not isinstance(node, ast.AST):
+                    return True
+                if isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
+                    return False
+                if ignore_imports and isinstance(node, (ast.Import, ast.ImportFrom)):
+                    return True
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    stmt_stack.append(node)
+                    try:
+                        if not _visit(node.decorator_list, in_fn):
+                            return False
+                        for grp in (node.args.posonlyargs, node.args.args, node.args.kwonlyargs):
+                            for a in grp:
+                                if not _visit(a.annotation, in_fn):
+                                    return False
+                        for a in (node.args.vararg, node.args.kwarg):
+                            if a is not None and not _visit(a.annotation, in_fn):
+                                return False
+                        if not _visit(node.args.defaults, in_fn):
+                            return False
+                        if not _visit(node.args.kw_defaults, in_fn):
+                            return False
+                        if not _visit(node.returns, in_fn):
+                            return False
+                        if not _visit(getattr(node, "type_params", None), in_fn):
+                            return False
+                        if not _visit(node.body, True):
+                            return False
+                    finally:
+                        stmt_stack.pop()
+                    return True
+                if isinstance(node, ast.Lambda):
+                    if not _visit(node.args.defaults, in_fn):
+                        return False
+                    if not _visit(node.args.kw_defaults, in_fn):
+                        return False
+                    return _visit(node.body, True)
+                if isinstance(node, ast.ClassDef):
+                    stmt_stack.append(node)
+                    try:
+                        if not _visit(node.decorator_list, in_fn):
+                            return False
+                        if not _visit(node.bases, in_fn):
+                            return False
+                        if not _visit(node.keywords, in_fn):
+                            return False
+                        if not _visit(getattr(node, "type_params", None), in_fn):
+                            return False
+                        if not _visit(node.body, in_fn):
+                            return False
+                    finally:
+                        stmt_stack.pop()
+                    return True
+                if isinstance(node, ast.Name):
+                    if node.id == name:
+                        sites.append((node.ctx, in_fn, stmt_stack[-1] if stmt_stack else None, node))
+                    return True
+                if isinstance(node, ast.Attribute):
+                    if node.attr == name:
+                        sites.append((node.ctx, in_fn, stmt_stack[-1] if stmt_stack else None, node))
+                    return _visit(node.value, in_fn)
+                pushed = isinstance(node, ast.stmt)
+                if pushed:
+                    stmt_stack.append(node)
+                try:
+                    for ch in ast.iter_child_nodes(node):
+                        if not _visit(ch, in_fn):
+                            return False
+                finally:
+                    if pushed:
+                        stmt_stack.pop()
+                return True
+
+            if not _visit(root, False):
+                return None
+            return sites
+
+        sites = _ref_sites(old_mod, ignore_imports=False)
+        if sites is None:
+            return None
+        mod_lines: Set[int] = set()
+        for ctx, in_fn, enc_stmt, ref_node in sites:
+            if (
+                isinstance(ctx, ast.Store)
+                and enc_stmt is not None
+                and enc_stmt.lineno == assign_lineno
+                and isinstance(ref_node, ast.Name)
+            ):
+                continue
+            if isinstance(ctx, (ast.Store, ast.Del)):
+                return None
+            if not in_fn or enc_stmt is None:
+                return None
+            s0, s1 = _stmt_span(enc_stmt)
+            mod_lines.update(range(s0, s1 + 1))
+
+        once_set = set(self.raw_once_lines.get(rel_path, ())) | set(self.import_trigger_lines.get(rel_path, {}).keys())
+        if mod_lines & once_set:
+            return None
+
+        base = self._lines_cov(rel_path, mod_lines) if mod_lines else 0
+        live = 0
+        name_word_re = re.compile(rf"\b{re.escape(name)}\b")
+        for f in self._importers_of(rel_path):
+            f_src = self._read_src(f)
+            if not f_src or not name_word_re.search(f_src):
+                continue
+            if f in self.file_to_livemask:
+                live |= self.file_to_livemask[f]
+                continue
+            if f.endswith("__init__.py") or any(m in f_src for m in _DYN_MARKERS) or quoted_re.search(f_src):
+                return None
+            try:
+                f_mod = ast.parse(f_src)
+            except SyntaxError:
+                return None
+            for sub in ast.walk(f_mod):
+                if isinstance(sub, ast.ImportFrom):
+                    if any(a.name == name and a.asname and a.asname != name for a in sub.names):
+                        return None
+            f_sites = _ref_sites(f_mod, ignore_imports=True)
+            if f_sites is None:
+                return None
+            f_lines: Set[int] = set()
+            for ctx, in_fn, enc_stmt, _ in f_sites:
+                if isinstance(ctx, (ast.Store, ast.Del)):
+                    return None
+                if not in_fn or enc_stmt is None:
+                    return None
+                s0, s1 = _stmt_span(enc_stmt)
+                f_lines.update(range(s0, s1 + 1))
+            f_once = set(self.raw_once_lines.get(f, ())) | set(self.import_trigger_lines.get(f, {}).keys())
+            if f_lines & f_once:
+                return None
+            if f_lines:
+                base |= self._lines_cov(f, f_lines)
+
+        return base, live
+
     def _diff_scope_stmts(
         self,
         old_stmts: List[ast.stmt],
@@ -2214,6 +2954,22 @@ class SelectorEngine:
                                         n_dk = dk_mask.bit_count()
                                         self._note("dict_key_zero:EXPRESSION_METADATA" if n_dk == 0 else f"dict_key:EXPRESSION_METADATA:{n_dk}")
                                     continue
+
+                        if (
+                            old_counts.get(attr, 0) == 1
+                            and new_counts.get(attr, 0) == 1
+                            and _is_pure_literal(ov)
+                            and _is_pure_literal(nv)
+                        ):
+                            old_src_txt = "\n".join(old_lines)
+                            res = self._module_const_readers(rel_path, attr, old_mod, old_src_txt, os_.lineno)
+                            if res is not None:
+                                base |= res[0]
+                                live |= res[1]
+                                self._trusted_marks += 1
+                                if self._trace:
+                                    self._note(f"module_const:{rel_path}:{attr}:{(res[0] | res[1]).bit_count()}")
+                                continue
 
             # Filter pairwise AST-equal replacements before fallback!
             if tag == "replace" and (i2 - i1) == (j2 - j1):
@@ -2502,12 +3258,28 @@ class SelectorEngine:
                     self._note(f"uncertainty:{rel_path}")
             return fb, fl
 
-        base = self._file_access(rel_path)
         new_lines = new_src.splitlines()
+        neutral_kinds: Set[str] = set()
+        if rel_path.startswith("sqlglot/"):
+            nb, neutral_kinds = self._neutral_filter(
+                rel_path, old_src, old_mod, new_mod, old_lines=old_lines, new_lines=new_lines
+            )
+            if neutral_kinds:
+                new_mod = ast.Module(body=nb, type_ignores=getattr(new_mod, "type_ignores", []))
+
+        base = self._file_access(rel_path)
         if len(old_mod.body) == len(new_mod.body) and all(
             _node_same_fast(os_, ns_, old_lines, new_lines) for os_, ns_ in zip(old_mod.body, new_mod.body)
         ):
             self._last_ast_eq = True
+            if neutral_kinds:
+                if self._trace:
+                    self._note(f"neutral:{rel_path}:{'+'.join(sorted(neutral_kinds))}")
+                return base, (
+                    self._get_subprocess_livemask()
+                    if neutral_kinds & {"stdlib_import_add", "import_reorder"}
+                    else 0
+                )
             if self._trace:
                 self._note(f"fixture:{rel_path}" if base else f"inert:{rel_path}")
             return base, 0
@@ -2527,6 +3299,7 @@ class SelectorEngine:
                 allow_ann=self._rule_enabled("noop_annotation"),
                 allow_notop=self._rule_enabled("noop_notop"),
                 allow_tc=self._rule_enabled("noop_type_checking"),
+                allow_fstr=self._rule_enabled("noop_fstring"),
                 future_ann=_has_future_annotations(old_mod) and _has_future_annotations(new_mod),
                 has_from_tc=tc_old and tc_new,
                 typing_aliases=frozenset(al_old & al_new),
@@ -2537,14 +3310,7 @@ class SelectorEngine:
                 self._last_ast_eq = True
                 extra_live = 0
                 if "opswap" in sem_ctx.kinds and self.eq_sites_stats and not self.eq_sites_stats.get("child_records"):
-                    if self._subprocess_livemask is None:
-                        m = 0
-                        for tid in self.subprocess_test_ids:
-                            num = self.id_to_num.get(tid)
-                            if num is not None:
-                                m |= 1 << num
-                        self._subprocess_livemask = m
-                    extra_live = self._subprocess_livemask
+                    extra_live = self._get_subprocess_livemask()
                 if self._trace:
                     self._note(f"semantic_noop:{rel_path}:{'+'.join(sorted(sem_ctx.kinds))}")
                 return base, extra_live
