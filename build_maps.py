@@ -22,6 +22,11 @@ Outputs RWX_track/maps/blast_maps.pkl.zlib containing ONLY baseline commit facts
     metaclass hooks / memoized builders); per-test coverage under-attributes them (version 3)
   - collection_lines: {rel_path: {lineno_int: [test_rel_path, ...]}} sqlglot lines executed during test
     file collection / import (version 4)
+  - import_trigger_lines: {rel_path: {lineno_int: [trigger_rel_path, ...]}} runtime-executed lines also
+    executed while importing trigger module(s) (version 5)
+  - dict_value_import_reads: frozenset[str] of UPPER attr names whose values are read unsafely at import/once time
+  - str_const_idents: frozenset[str] of identifier string constants across sqlglot/ and tests/
+  - known_words: frozenset[str] of all identifiers and \\w+ tokens in strings across sqlglot/ and tests/
   - lazy_test_importers: {rel_path: [test_rel_path, ...]} reached only via lazy/dynamic imports
   - path_mentions: {top_level_entry: [test_rel_path, ...]} for files outside sqlglot/ and tests/
   - eq_safe_sites: {rel_path: frozenset[(lineno, col, end_lineno, end_col)]} dynamically proven safe Compare sites (version 4)
@@ -36,6 +41,7 @@ from __future__ import annotations
 import ast
 import builtins
 import concurrent.futures
+import enum
 import importlib
 import io
 import json
@@ -43,6 +49,7 @@ import os
 import pathlib
 import pickle
 import pkgutil
+import re
 import sys
 import time
 import unittest
@@ -417,6 +424,11 @@ _ANNOTATOR_TRACKED_DICTS = (
 
 
 def _norm_dict_key(k: Any) -> Optional[str]:
+    if isinstance(k, enum.Enum):
+        name = getattr(k, "name", None)
+        if isinstance(name, str) and name in type(k).__members__:
+            return f"enum:{type(k).__name__}.{name}"
+        return None
     if isinstance(k, str):
         return f"str:{k}"
     if isinstance(k, int) and not isinstance(k, bool):
@@ -578,6 +590,19 @@ def run_pass2_dynamic_hooks(
         for ckey in mro_keys:
             by_attr[(ckey, kn)].add(ctx)
 
+    def _log_dict_all(td_id: int, mro_keys: Tuple[str, ...], attr: str) -> None:
+        ctx = state["ctx"]
+        if not ctx:
+            return
+        cache_k = (td_id, "__all__")
+        seen = state["seen_dict_keys"]
+        if cache_k in seen:
+            return
+        seen.add(cache_k)
+        by_attr = raw_dict_usage[attr]
+        for ckey in mro_keys:
+            by_attr[(ckey, "__all__")].add(ctx)
+
     class _TrackedDict(dict):
         __slots__ = ("_mro", "_attr", "_td_id")
 
@@ -608,11 +633,53 @@ def run_pass2_dynamic_hooks(
                 _log_dict_hit(self._td_id, self._mro, self._attr, k)
             return found
 
+        def __iter__(self):
+            if state["ctx"]:
+                _log_dict_all(self._td_id, self._mro, self._attr)
+            return dict.__iter__(self)
+
+        def keys(self):
+            if state["ctx"]:
+                _log_dict_all(self._td_id, self._mro, self._attr)
+            return dict.keys(self)
+
+        def items(self):
+            if state["ctx"]:
+                _log_dict_all(self._td_id, self._mro, self._attr)
+            return dict.items(self)
+
+        def values(self):
+            if state["ctx"]:
+                _log_dict_all(self._td_id, self._mro, self._attr)
+            return dict.values(self)
+
         def copy(self) -> dict:
-            return dict(self)
+            if state["ctx"]:
+                _log_dict_all(self._td_id, self._mro, self._attr)
+            return dict(dict.items(self))
+
+        def __or__(self, other):
+            if state["ctx"]:
+                _log_dict_all(self._td_id, self._mro, self._attr)
+            return dict.__or__(self, other)
+
+        def __ror__(self, other):
+            if state["ctx"]:
+                _log_dict_all(self._td_id, self._mro, self._attr)
+            return dict.__ror__(self, other)
+
+        def __eq__(self, other):
+            if state["ctx"]:
+                _log_dict_all(self._td_id, self._mro, self._attr)
+            return dict.__eq__(self, other)
+
+        def __ne__(self, other):
+            if state["ctx"]:
+                _log_dict_all(self._td_id, self._mro, self._attr)
+            return dict.__ne__(self, other)
 
         def __reduce__(self):
-            return (dict, (dict(self),))
+            return (dict, (dict(dict.items(self)),))
 
     def _wrap_cls_dicts(cls: type, attrs: Tuple[str, ...]) -> None:
         for attr in attrs:
@@ -1250,17 +1317,52 @@ def build_lazy_test_importers(repo: pathlib.Path, rev_imports: Dict[str, List[st
 
 
 _ONCE_PROBE_SCRIPT = r'''
-import importlib, json, os, pathlib, pkgutil, sys, warnings
+import importlib, importlib.abc, importlib.machinery, json, os, pathlib, pkgutil, sys, warnings
 warnings.simplefilter("ignore")
 repo, out = sys.argv[1], sys.argv[2]
 repo_path = pathlib.Path(repo).resolve()
+sqlglot_root = (repo_path / "sqlglot").resolve()
 sys.path.insert(0, str(repo_path))
 os.chdir(repo_path)
 import coverage
 cov = coverage.Coverage(data_file=None, source=[os.path.join(str(repo_path), "sqlglot")], branch=False)
 cov.start()
 
-cov.switch_context("imp")
+_ctx_stack = [""]
+
+def _set_base_ctx(tag):
+    _ctx_stack[0] = tag
+    cov.switch_context(tag)
+
+class _ImpFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname != "sqlglot" and not fullname.startswith("sqlglot."):
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
+        if spec is None or not spec.origin or not spec.origin.endswith(".py"):
+            return None
+        orig = pathlib.Path(spec.origin).resolve()
+        if not orig.is_relative_to(sqlglot_root):
+            return None
+        rel_origin = orig.relative_to(repo_path).as_posix()
+        loader = spec.loader
+        if loader is not None and not getattr(loader, "_blast_imp_wrapped", False):
+            orig_exec = loader.exec_module
+            def _wrapped_exec(mod, _orig=orig_exec, _ctx="imp:" + rel_origin):
+                _ctx_stack.append(_ctx)
+                cov.switch_context(_ctx)
+                try:
+                    return _orig(mod)
+                finally:
+                    _ctx_stack.pop()
+                    cov.switch_context(_ctx_stack[-1])
+            loader.exec_module = _wrapped_exec
+            loader._blast_imp_wrapped = True
+        return spec
+
+sys.meta_path.insert(0, _ImpFinder())
+
+_set_base_ctx("imp")
 import sqlglot
 from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect, Dialects
@@ -1276,7 +1378,7 @@ tests_root = repo_path / "tests"
 for test_file in sorted(tests_root.rglob("test_*.py"), key=lambda p: p.as_posix()):
     rel = test_file.relative_to(repo_path).as_posix()
     modname = rel[:-3].replace("/", ".")
-    cov.switch_context("col:" + rel)
+    _set_base_ctx("col:" + rel)
     try:
         importlib.import_module(modname)
     except Exception:
@@ -1290,7 +1392,7 @@ SQLS = [
 ]
 
 def _round(tag):
-    cov.switch_context(tag)
+    _set_base_ctx(tag)
     from sqlglot.optimizer import optimize
     for d in [""] + [x.value for x in Dialects if x.value]:
         try:
@@ -1319,15 +1421,18 @@ cov.stop()
 data = cov.get_data()
 once_out = {}
 collect_out = {}
+trig_out = {}
 for fname in data.measured_files():
     rel = os.path.relpath(fname, str(repo_path)).replace(os.sep, "/")
     if not rel.startswith("sqlglot/"):
         continue
-    imp, r1, r2 = set(), set(), set()
+    impL, r1, r2 = set(), set(), set()
     col_map = {}
-    for ln, ctxs in data.contexts_by_lineno(fname).items():
-        if "imp" in ctxs:
-            imp.add(ln)
+    trig_map = {}
+    by_ln = data.contexts_by_lineno(fname)
+    for ln, ctxs in by_ln.items():
+        if any(c == "imp" or c.startswith("imp:") for c in ctxs):
+            impL.add(ln)
         if "r1" in ctxs:
             r1.add(ln)
         if "r2" in ctxs:
@@ -1335,23 +1440,32 @@ for fname in data.measured_files():
         cols = sorted(c[4:] for c in ctxs if c.startswith("col:"))
         if cols:
             col_map[str(ln)] = cols
-    once = sorted(imp | (r1 - r2))
+    once = sorted((impL - r2) | (r1 - r2))
+    for ln in sorted(impL & r2):
+        ctxs = by_ln.get(ln, ())
+        trigs = sorted({c[4:] for c in ctxs if c.startswith("imp:")})
+        if not trigs:
+            trigs = [rel]
+        trig_map[str(ln)] = trigs
     if once:
         once_out[rel] = once
     if col_map:
         collect_out[rel] = col_map
+    if trig_map:
+        trig_out[rel] = trig_map
 with open(out, "w") as f:
-    json.dump({"once": once_out, "collect": collect_out}, f)
+    json.dump({"once": once_out, "collect": collect_out, "trig": trig_out}, f)
 '''
 
 
 def run_once_lines_probe(
     repo: pathlib.Path, cache_dir: pathlib.Path
-) -> Tuple[Dict[str, List[int]], Dict[str, Dict[int, List[str]]]]:
-    """Detect lines executed at import time, test-collection time, or once per process.
+) -> Tuple[Dict[str, List[int]], Dict[str, Dict[int, List[str]]], Dict[str, Dict[int, List[str]]]]:
+    """Detect lines executed once per process, during test collection, or triggered by importing a module.
 
-    - `once_lines`: lines executed during sqlglot package import (`imp`) or only in warm-up round 1 (`r1 - r2`).
+    - `once_lines`: lines in `(impL - r2) | (r1 - r2)`.
     - `collection_lines`: {rel_path: {lineno: [test_rel_path, ...]}} hit while importing each `tests/**/test_*.py`.
+    - `import_trigger_lines`: {rel_path: {lineno: [trigger_rel_path, ...]}} for runtime-executed lines (`impL & r2`).
     """
     import subprocess
 
@@ -1368,14 +1482,293 @@ def run_once_lines_probe(
     collection_lines = {
         k: {int(ln): list(tfs) for ln, tfs in d.items()} for k, d in res.get("collect", {}).items()
     }
+    import_trigger_lines = {
+        k: {int(ln): list(trigs) for ln, trigs in d.items()} for k, d in res.get("trig", {}).items()
+    }
     col_line_cnt = sum(len(d) for d in collection_lines.values())
+    trig_line_cnt = sum(len(d) for d in import_trigger_lines.values())
     print(
-        f"[Pass 4] once+collect probe: once={len(once_lines)} files / {sum(len(v) for v in once_lines.values())} lines, "
-        f"collect={len(collection_lines)} files / {col_line_cnt} lines in {time.perf_counter() - t0:.1f}s",
+        f"[Pass 4] once+collect+trig probe: once={len(once_lines)} files / {sum(len(v) for v in once_lines.values())} lines, "
+        f"collect={len(collection_lines)} files / {col_line_cnt} lines, "
+        f"trig={len(import_trigger_lines)} files / {trig_line_cnt} lines in {time.perf_counter() - t0:.1f}s",
         file=sys.stderr,
         flush=True,
     )
-    return once_lines, collection_lines
+    return once_lines, collection_lines, import_trigger_lines
+
+
+_IDENT_STR_RE = re.compile(r"^[A-Za-z_]\w*$")
+_WORD_RE = re.compile(r"\w+")
+_SAFE_DICT_CALL_FUNCS = frozenset({"len", "bool", "sorted", "set", "list", "tuple", "frozenset"})
+
+
+def build_vocab_sets(repo: pathlib.Path) -> Tuple[Set[str], Set[str]]:
+    """Scan sqlglot/ and tests/ .py files for identifier string constants and known word tokens."""
+    str_const_idents: Set[str] = set()
+    known_words: Set[str] = set()
+    for top in ("sqlglot", "tests"):
+        for p in sorted((repo / top).rglob("*.py")):
+            if "__pycache__" in p.parts:
+                continue
+            try:
+                tree = ast.parse(p.read_text("utf-8", errors="replace"))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    s = node.value
+                    if _IDENT_STR_RE.match(s):
+                        str_const_idents.add(s)
+                    known_words.update(_WORD_RE.findall(s))
+                elif isinstance(node, ast.Name):
+                    known_words.add(node.id)
+                elif isinstance(node, ast.Attribute):
+                    known_words.add(node.attr)
+                elif isinstance(node, ast.arg):
+                    known_words.add(node.arg)
+                elif isinstance(node, ast.alias):
+                    known_words.add(node.name)
+                    known_words.update(node.name.split("."))
+                    if node.asname:
+                        known_words.add(node.asname)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    known_words.update(node.module.split("."))
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    known_words.add(node.name)
+    return str_const_idents, known_words
+
+
+def build_dict_value_import_reads(repo: pathlib.Path, once_union: Dict[str, Set[int]]) -> Set[str]:
+    """Identify UPPER attr names read by value on import-time / once-only lines inside sqlglot/."""
+    unsafe: Set[str] = set()
+
+    def _enclosing_scope(node: ast.AST, parent: Dict[ast.AST, ast.AST]) -> Optional[ast.AST]:
+        cur = parent.get(node)
+        while cur is not None:
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.Module)):
+                return cur
+            cur = parent.get(cur)
+        return None
+
+    def _loads_in_scope(scope: ast.AST, ident: str) -> List[ast.Name]:
+        out: List[ast.Name] = []
+        for sub in ast.walk(scope):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load) and sub.id == ident:
+                out.append(sub)
+        return out
+
+    def _is_keys_only_ok(
+        node: ast.AST,
+        attr_name: str,
+        scope: Optional[ast.AST],
+        parent: Dict[ast.AST, ast.AST],
+        depth: int,
+    ) -> bool:
+        p = parent.get(node)
+        if p is None:
+            return False
+        if isinstance(p, ast.Compare):
+            return any(comp is node and isinstance(op, (ast.In, ast.NotIn)) for op, comp in zip(p.ops, p.comparators))
+        if isinstance(p, (ast.For, ast.AsyncFor, ast.comprehension)) and p.iter is node:
+            return True
+        if isinstance(p, ast.Call):
+            if (
+                isinstance(p.func, ast.Name)
+                and p.func.id in _SAFE_DICT_CALL_FUNCS
+                and len(p.args) == 1
+                and p.args[0] is node
+                and not p.keywords
+            ):
+                return True
+            if node in p.args:
+                return _is_safe_handoff_call(p)
+        if isinstance(p, ast.keyword) and p.value is node:
+            gp = parent.get(p)
+            if isinstance(gp, ast.Call):
+                return _is_safe_handoff_call(gp)
+            return False
+        if isinstance(p, (ast.If, ast.While, ast.IfExp)) and p.test is node:
+            return True
+        if isinstance(p, ast.BoolOp):
+            return True
+        if isinstance(p, ast.UnaryOp) and isinstance(p.op, ast.Not) and p.operand is node:
+            return True
+        if isinstance(p, ast.Attribute) and p.value is node and p.attr == "keys":
+            gp = parent.get(p)
+            return isinstance(gp, ast.Call) and gp.func is p
+        if isinstance(p, ast.Dict) and isinstance(scope, ast.ClassDef):
+            if any(k is None and v is node for k, v in zip(p.keys, p.values)):
+                gp = parent.get(p)
+                if parent.get(gp) is scope:  # directly in ClassDef body
+                    if isinstance(gp, ast.Assign) and gp.value is p and len(gp.targets) == 1 and isinstance(gp.targets[0], ast.Name) and gp.targets[0].id == attr_name:
+                        return True
+                    if isinstance(gp, ast.AnnAssign) and gp.value is p and isinstance(gp.target, ast.Name) and gp.target.id == attr_name:
+                        return True
+        if depth == 0 and scope is not None and isinstance(p, ast.Assign) and p.value is node and len(p.targets) == 1 and isinstance(p.targets[0], ast.Name):
+            alias_name = p.targets[0].id
+            loads = _loads_in_scope(scope, alias_name)
+            if not loads:
+                return False
+            return all(_is_keys_only_ok(ld, attr_name, scope, parent, depth + 1) for ld in loads)
+        return False
+
+    def _is_safe_handoff_call(call: ast.Call) -> bool:
+        fn = call.func
+        if isinstance(fn, ast.Name) and fn.id in {"dict", "copy", "deepcopy"}:
+            return False
+        if isinstance(fn, ast.Attribute) and fn.attr in {"copy", "update", "deepcopy"}:
+            return False
+        return True
+
+    for p in sorted((repo / "sqlglot").rglob("*.py")):
+        if "__pycache__" in p.parts:
+            continue
+        rel = p.relative_to(repo).as_posix()
+        once_lines = once_union.get(rel)
+        if not once_lines:
+            continue
+        try:
+            tree = ast.parse(p.read_text("utf-8", errors="replace"))
+        except SyntaxError:
+            continue
+        parent: Dict[ast.AST, ast.AST] = {}
+        for par in ast.walk(tree):
+            for ch in ast.iter_child_nodes(par):
+                parent[ch] = par
+        for node in ast.walk(tree):
+            ln = getattr(node, "lineno", 0)
+            if ln not in once_lines:
+                continue
+            attr_name: Optional[str] = None
+            scope = _enclosing_scope(node, parent)
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr.isupper():
+                attr_name = node.attr
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id.isupper() and isinstance(scope, ast.ClassDef):
+                attr_name = node.id
+            if attr_name is None:
+                continue
+            if not _is_keys_only_ok(node, attr_name, scope, parent, 0):
+                unsafe.add(attr_name)
+    return unsafe
+
+
+def _audit_ast_canon_dict_key(node: ast.AST) -> Optional[str]:
+    if isinstance(node, ast.Constant):
+        v = node.value
+        if isinstance(v, str):
+            return f"str:{v}"
+        if isinstance(v, int) and not isinstance(v, bool):
+            return f"int:{v}"
+        return None
+    if isinstance(node, ast.Tuple):
+        parts: List[str] = []
+        for elt in node.elts:
+            ce = _audit_ast_canon_dict_key(elt)
+            if ce is None:
+                return None
+            parts.append(ce)
+        return "tuple:(" + ",".join(parts) + ")"
+    if isinstance(node, ast.Attribute):
+        v = node.value
+        if isinstance(v, ast.Name):
+            if v.id == "exp":
+                return f"cls:{node.attr}"
+            if v.id in ("TokenType", "DType"):
+                return f"enum:{v.id}.{node.attr}"
+        elif isinstance(v, ast.Attribute) and isinstance(v.value, ast.Name):
+            if v.value.id == "exp" and v.attr == "DType":
+                return f"enum:DType.{node.attr}"
+    return None
+
+
+def _audit_strip_key_prefixes(norm_key: str) -> str:
+    return re.sub(r"\b(?:enum|int|str|cls):", "", norm_key)
+
+
+def _audit_extract_single_assign(stmt: ast.stmt) -> Optional[Tuple[str, ast.AST]]:
+    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+        return stmt.targets[0].id, stmt.value
+    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+        return stmt.target.id, stmt.value
+    return None
+
+
+def build_dict_key_mismatch_attrs(
+    repo: pathlib.Path,
+    dict_key_usage: Dict[str, Dict[str, Dict[str, Any]]],
+    tracked_classes: Any,
+) -> Set[str]:
+    """Detect tracked dict attrs whose static AST keys disagree in prefix/format with runtime dict_key_usage."""
+    tracked_set = set(tracked_classes)
+    mismatch: Set[str] = set()
+    # Any runtime int: non-numeric or Enum-like str:TokenType./str:DType. key indicates normalization mismatch.
+    bad_int_re = re.compile(r"(?:^|\()int:(?!-?\d+(?:$|\)|,))")
+    bad_enum_str_re = re.compile(r"(?:^|\()str:(?:TokenType|DType)\.")
+    for attr, by_cls in dict_key_usage.items():
+        for kv in by_cls.values():
+            for rk in kv:
+                if bad_int_re.search(rk) or bad_enum_str_re.search(rk):
+                    mismatch.add(attr)
+                    break
+
+    global_stripped: Dict[str, Dict[str, Set[str]]] = {}
+    for attr, by_cls in dict_key_usage.items():
+        sm: Dict[str, Set[str]] = defaultdict(set)
+        for kv in by_cls.values():
+            for rk in kv:
+                if rk != "__all__":
+                    sm[_audit_strip_key_prefixes(rk)].add(rk)
+        global_stripped[attr] = sm
+
+    def _scan_body(body: List[ast.stmt], rel: str, cls_stack: List[str]) -> None:
+        if cls_stack:
+            counts: Dict[str, int] = defaultdict(int)
+            for st in body:
+                sa = _audit_extract_single_assign(st)
+                if sa is not None:
+                    counts[sa[0]] += 1
+            cls_key = f"{rel}::{'.'.join(cls_stack)}"
+            if cls_key in tracked_set:
+                for st in body:
+                    sa = _audit_extract_single_assign(st)
+                    if sa is None or not isinstance(sa[1], ast.Dict):
+                        continue
+                    attr, dnode = sa
+                    if counts[attr] != 1 or attr not in dict_key_usage:
+                        continue
+                    by_cls = dict_key_usage.get(attr, {}).get(cls_key, {})
+                    local_stripped: Dict[str, Set[str]] = defaultdict(set)
+                    for rk in by_cls:
+                        if rk != "__all__":
+                            local_stripped[_audit_strip_key_prefixes(rk)].add(rk)
+                    sm_attr = global_stripped.get(attr, {})
+                    for k in dnode.keys:
+                        if k is None:
+                            continue
+                        ck = _audit_ast_canon_dict_key(k)
+                        if ck is None or ck in by_cls:
+                            continue
+                        sk = _audit_strip_key_prefixes(ck)
+                        alts = (local_stripped.get(sk, set()) or sm_attr.get(sk, set())) - {ck}
+                        if alts:
+                            mismatch.add(attr)
+                            break
+        for st in body:
+            if isinstance(st, ast.ClassDef):
+                cls_stack.append(st.name)
+                _scan_body(st.body, rel, cls_stack)
+                cls_stack.pop()
+
+    for p in sorted((repo / "sqlglot").rglob("*.py")):
+        if "__pycache__" in p.parts:
+            continue
+        rel = p.relative_to(repo).as_posix()
+        try:
+            tree = ast.parse(p.read_text("utf-8", errors="replace"), filename=rel)
+        except SyntaxError:
+            continue
+        _scan_body(tree.body, rel, [])
+    return mismatch
 
 
 def build_path_mentions(repo: pathlib.Path) -> Dict[str, List[str]]:
@@ -1869,7 +2262,23 @@ def _augment_main() -> None:
         payload["metaclass_attrs"],
     ) = build_static_graphs(repo)
     payload["lazy_test_importers"] = build_lazy_test_importers(repo, payload["rev_imports"])
-    payload["once_lines"], payload["collection_lines"] = run_once_lines_probe(repo, cache_dir)
+    once_lines, collection_lines, import_trigger_lines = run_once_lines_probe(repo, cache_dir)
+    payload["once_lines"] = once_lines
+    payload["collection_lines"] = collection_lines
+    payload["import_trigger_lines"] = import_trigger_lines
+    once_union: Dict[str, Set[int]] = {}
+    for rel, lns in once_lines.items():
+        once_union.setdefault(rel, set()).update(lns)
+    for rel, lmap in import_trigger_lines.items():
+        once_union.setdefault(rel, set()).update(lmap.keys())
+    str_const_idents, known_words = build_vocab_sets(repo)
+    payload["dict_value_import_reads"] = frozenset(build_dict_value_import_reads(repo, once_union))
+    payload["str_const_idents"] = frozenset(str_const_idents)
+    payload["known_words"] = frozenset(known_words)
+    payload["dict_key_mismatch_attrs"] = frozenset(
+        build_dict_key_mismatch_attrs(repo, payload.get("dict_key_usage", {}), payload.get("tracked_dict_classes", ()))
+    )
+    print(f"[Pass 5] dict_key_mismatch_attrs: {sorted(payload['dict_key_mismatch_attrs'])}", file=sys.stderr, flush=True)
     payload["path_mentions"] = build_path_mentions(repo)
     print(f"[Pass 5] path_mentions: {payload['path_mentions']}", file=sys.stderr, flush=True)
     eq_res = run_eqsite_probe(repo, cache_dir)
@@ -1877,7 +2286,7 @@ def _augment_main() -> None:
     payload["eq_sites_stats"] = eq_res.get("stats", {})
     payload["subprocess_test_ids"] = build_subprocess_tests(repo, payload.get("test_ids"))
     print(f"[Pass 6] subprocess_test_ids: {payload['subprocess_test_ids']}", file=sys.stderr, flush=True)
-    payload["version"] = max(int(payload.get("version", 3)), 4)
+    payload["version"] = max(int(payload.get("version", 4)), 5)
     raw_bytes = pickle.dumps(payload, protocol=5)
     comp_bytes = zlib.compress(raw_bytes, level=9)
     maps_path.write_bytes(comp_bytes)
@@ -1902,6 +2311,10 @@ def main() -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     os.environ["SKIP_INTEGRATION"] = "0"
+    py_bin = str(pathlib.Path(sys.executable).parent)
+    old_path = os.environ.get("PATH", "")
+    if py_bin not in old_path.split(os.pathsep):
+        os.environ["PATH"] = f"{py_bin}{os.pathsep}{old_path}" if old_path else py_bin
     os.chdir(repo)
     if str(repo) not in sys.path:
         sys.path.insert(0, str(repo))
@@ -1950,7 +2363,18 @@ def main() -> None:
         metaclass_attrs,
     ) = build_static_graphs(repo)
 
-    once_lines, collection_lines = run_once_lines_probe(repo, cache_dir)
+    once_lines, collection_lines, import_trigger_lines = run_once_lines_probe(repo, cache_dir)
+    once_union: Dict[str, Set[int]] = {}
+    for rel, lns in once_lines.items():
+        once_union.setdefault(rel, set()).update(lns)
+    for rel, lmap in import_trigger_lines.items():
+        once_union.setdefault(rel, set()).update(lmap.keys())
+    str_const_idents, known_words = build_vocab_sets(repo)
+    dict_value_import_reads = frozenset(build_dict_value_import_reads(repo, once_union))
+    dict_key_mismatch_attrs = frozenset(
+        build_dict_key_mismatch_attrs(repo, pass2["dict_key_usage"], pass2["tracked_dict_classes"])
+    )
+    print(f"[Pass 5] dict_key_mismatch_attrs: {sorted(dict_key_mismatch_attrs)}", file=sys.stderr, flush=True)
     payload = {
         "version": 2,
         "commit": "eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
@@ -1970,6 +2394,11 @@ def main() -> None:
         "metaclass_attrs": metaclass_attrs,
         "once_lines": once_lines,
         "collection_lines": collection_lines,
+        "import_trigger_lines": import_trigger_lines,
+        "dict_value_import_reads": dict_value_import_reads,
+        "str_const_idents": frozenset(str_const_idents),
+        "known_words": frozenset(known_words),
+        "dict_key_mismatch_attrs": dict_key_mismatch_attrs,
         "path_mentions": build_path_mentions(repo),
         "lazy_test_importers": build_lazy_test_importers(repo, rev_imports),
         "subprocess_test_ids": build_subprocess_tests(repo, test_ids),
@@ -1977,7 +2406,7 @@ def main() -> None:
     eq_res = run_eqsite_probe(repo, cache_dir)
     payload["eq_safe_sites"] = _site_dict_to_frozensets(eq_res.get("safe_sites", {}))
     payload["eq_sites_stats"] = eq_res.get("stats", {})
-    payload["version"] = 4
+    payload["version"] = 5
     raw_bytes = pickle.dumps(payload, protocol=5)
     comp_bytes = zlib.compress(raw_bytes, level=9)
     out_path.write_bytes(comp_bytes)
@@ -1994,6 +2423,10 @@ def _main_pass2() -> None:
     pass2_out = pathlib.Path(sys.argv[4]).resolve()
     pytest_targets = sys.argv[5:] or None
     os.environ["SKIP_INTEGRATION"] = "0"
+    py_bin = str(pathlib.Path(sys.executable).parent)
+    old_path = os.environ.get("PATH", "")
+    if py_bin not in old_path.split(os.pathsep):
+        os.environ["PATH"] = f"{py_bin}{os.pathsep}{old_path}" if old_path else py_bin
     os.chdir(repo)
     if str(repo) not in sys.path:
         sys.path.insert(0, str(repo))

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import enum
 import json
 import os
 import pickle
@@ -15,6 +16,7 @@ from unittest import mock
 RWX_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(RWX_DIR))
 
+import build_maps  # noqa: E402
 import score  # noqa: E402
 import selector  # noqa: E402
 
@@ -181,6 +183,218 @@ class SelectorUnitTests(unittest.TestCase):
         )
         self.assertEqual(eng.select_commit(p_test), {0})
 
+    def test_v6_import_trigger_rule(self) -> None:
+        eng = _make_mini_engine()
+        src = (
+            "class Widget:\n"
+            "    def compute(self, x):\n"
+            "        if x > 0:\n"
+            "            return x + 1\n"
+            "        return 0\n"
+            "def helper():\n"
+            "    return 42\n"
+        )
+        eng._ast_cache["sqlglot/mod_a.py"] = (src, ast.parse(src))
+        eng.raw_line_cov["sqlglot/mod_a.py"] = {"4": [0], "7": [3]}
+        eng.import_trigger_lines = {"sqlglot/mod_a.py": {6: ["sqlglot/mod_b.py"], 7: ["sqlglot/mod_b.py"]}}
+        eng.rev_imports["sqlglot/mod_b.py"] = ["tests/test_beta.py"]
+        eng._line_cache.clear()
+        p = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -6,2 +6,2 @@\n"
+            " def helper():\n"
+            "-    return 42\n"
+            "+    return 43\n"
+        )
+        # With import_trigger enabled, helper() keeps runtime cov {3} and adds mod_b's importer test {2} (no mod_a nuclear escalation {0, 1}).
+        self.assertEqual(eng.select_commit(p), {2, 3})
+        # With import_trigger disabled, falls back to once_escalation -> mod_a users + importers {0, 1, 2, 3}.
+        selector.DISABLED.add("import_trigger")
+        self.assertEqual(eng.select_commit(p), {0, 1, 2, 3})
+
+    def test_v6_dict_zero_trust_rule(self) -> None:
+        eng = _make_mini_engine()
+        src = "class Widget:\n    KEYWORDS = {'a': 1}\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src, ast.parse(src))
+        eng.tracked_dict_classes = {"sqlglot/mod_a.py::Widget"}
+        eng.raw_dict_key_usage = {"KEYWORDS": {"sqlglot/mod_a.py::Widget": {"str:b": [0]}}}
+        p = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " class Widget:\n"
+            "-    KEYWORDS = {'a': 1}\n"
+            "+    KEYWORDS = {'a': 2}\n"
+        )
+        # Zero readers with no __all__ and not in unsafe/str_const -> trusted 0-test selection (no empty_guard).
+        self.assertEqual(eng.select_commit(p), set())
+
+        # Unsafe import-value read -> keeps empty_guard ({1, 2}).
+        eng.dict_value_import_reads = frozenset({"KEYWORDS"})
+        self.assertEqual(eng.select_commit(p), {1, 2})
+        eng.dict_value_import_reads = frozenset()
+
+        # String constant mention -> keeps empty_guard ({1, 2}).
+        eng.str_const_idents = frozenset({"KEYWORDS"})
+        self.assertEqual(eng.select_commit(p), {1, 2})
+        eng.str_const_idents = frozenset()
+
+        # Whole-dict __all__ reader -> selected directly ({3}).
+        eng.raw_dict_key_usage["KEYWORDS"]["sqlglot/mod_a.py::Widget"]["__all__"] = [3]
+        self.assertEqual(eng.select_commit(p), {3})
+
+    def test_v6_added_module_narrow_rule(self) -> None:
+        eng = _make_mini_engine()
+        eng._ast_cache["sqlglot/mod_a.py"] = ("import os\n", ast.parse("import os\n"))
+        eng.known_words = frozenset({"existing_mod"})
+        eng.lazy_test_importers["sqlglot/typing/foo.py"] = ["tests/test_beta.py"]
+
+        def _added_patch(name: str, extra: str = "") -> str:
+            return (
+                f"diff --git a/sqlglot/typing/{name}.py b/sqlglot/typing/{name}.py\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                f"+++ b/sqlglot/typing/{name}.py\n"
+                "@@ -0,0 +1 @@\n"
+                "+X = 1\n"
+            ) + extra
+
+        # Unknown stem -> narrows to pkg_walkers {3} only (drops lazy sibling test 2).
+        self.assertEqual(eng.select_commit(_added_patch("brand_new_xyz")), {3})
+        # Known stem -> escalates to {2, 3}.
+        self.assertEqual(eng.select_commit(_added_patch("existing_mod")), {2, 3})
+        # Referenced in another section's added lines -> escalates to {2, 3}.
+        extra_ref = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -1 +1,2 @@\n"
+            "+# import brand_new_xyz\n"
+            " import os\n"
+        )
+        self.assertEqual(eng.select_commit(_added_patch("brand_new_xyz", extra_ref)), {2, 3})
+
+    def test_v6_decorator_removal_narrow_rule(self) -> None:
+        eng = _make_mini_engine()
+        src_bare = "class Widget:\n    @my_dec\n    def compute(self, x):\n        return x\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src_bare, ast.parse(src_bare))
+        eng.raw_line_cov["sqlglot/mod_a.py"] = {"2": [0], "3": [0], "4": [0]}
+        eng.lazy_test_importers = {"sqlglot/mod_a.py": ["tests/test_beta.py"]}
+        eng._line_cache.clear()
+        p_bare = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -1,4 +1,3 @@\n"
+            " class Widget:\n"
+            "-    @my_dec\n"
+            "     def compute(self, x):\n"
+            "         return x\n"
+        )
+        self.assertEqual(eng.select_commit(p_bare), {0})
+
+        # Decorator Call removal does NOT narrow.
+        src_call = "class Widget:\n    @my_dec(1)\n    def compute(self, x):\n        return x\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src_call, ast.parse(src_call))
+        p_call = p_bare.replace("@my_dec", "@my_dec(1)")
+        self.assertEqual(eng.select_commit(p_call), {0, 1, 2})
+
+        # Adding a decorator does NOT narrow.
+        src_none = "class Widget:\n    def compute(self, x):\n        return x\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src_none, ast.parse(src_none))
+        p_add = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -1,3 +1,4 @@\n"
+            " class Widget:\n"
+            "+    @my_dec\n"
+            "     def compute(self, x):\n"
+            "         return x\n"
+        )
+        self.assertEqual(eng.select_commit(p_add), {0, 1, 2})
+
+        # Removing @property does NOT narrow.
+        src_prop = "class Widget:\n    @property\n    def compute(self):\n        return 1\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src_prop, ast.parse(src_prop))
+        p_prop = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -1,4 +1,3 @@\n"
+            " class Widget:\n"
+            "-    @property\n"
+            "     def compute(self):\n"
+            "         return 1\n"
+        )
+        self.assertEqual(eng.select_commit(p_prop), {0, 1, 2})
+
+    def test_v6_noop_notop_and_type_checking(self) -> None:
+        def _cmp_site(src: str) -> tuple[int, int, int, int]:
+            for n in ast.walk(ast.parse(src)):
+                if isinstance(n, ast.Compare):
+                    return (n.lineno, n.col_offset, n.end_lineno or n.lineno, n.end_col_offset or n.col_offset)
+            raise AssertionError("no Compare")
+
+        def _check(old_s: str, new_s: str, *, use_safe: bool = False) -> tuple[bool, set[str]]:
+            om = ast.parse(old_s)
+            nm = ast.parse(new_s)
+            tc1, al1 = selector._typing_guard_info(om)
+            tc2, al2 = selector._typing_guard_info(nm)
+            sites = frozenset({_cmp_site(old_s)}) if use_safe else frozenset()
+            ctx = selector._SemEqCtx(
+                safe_sites=sites,
+                allow_opswap=True,
+                allow_notop=True,
+                allow_tc=True,
+                has_from_tc=tc1 and tc2,
+                typing_aliases=frozenset(al1 & al2),
+            )
+            ok = selector._sem_eq(om, nm, ctx)
+            return ok, set(ctx.kinds)
+
+        # notop: is / is not and in / not in (both directions)
+        for old_e, new_e in [
+            ("not (x is y)", "x is not y"),
+            ("x is not y", "not (x is y)"),
+            ("not (x in y)", "x not in y"),
+            ("x not in y", "not (x in y)"),
+        ]:
+            ok, kinds = _check(f"def f(x, y):\n    return {old_e}\n", f"def f(x, y):\n    return {new_e}\n")
+            self.assertTrue(ok, f"{old_e} <-> {new_e}")
+            self.assertEqual(kinds, {"notop"})
+
+        # notop: == / != requires safe site
+        ok, kinds = _check("def f(x, y):\n    return not (x == y)\n", "def f(x, y):\n    return x != y\n", use_safe=True)
+        self.assertTrue(ok)
+        self.assertEqual(kinds, {"notop"})
+        ok, _ = _check("def f(x, y):\n    return not (x == y)\n", "def f(x, y):\n    return x != y\n", use_safe=False)
+        self.assertFalse(ok)
+
+        # TYPE_CHECKING: valid guards vs non-typing / arbitrary name
+        for hdr, tst in [
+            ("from typing import TYPE_CHECKING\n", "TYPE_CHECKING"),
+            ("import typing as t\n", "t.TYPE_CHECKING"),
+            ("", "False"),
+        ]:
+            ok, kinds = _check(
+                f"{hdr}if {tst}:\n    from sqlglot import exp\nX = 1\n",
+                f"{hdr}if {tst}:\n    from sqlglot import parser\nX = 1\n",
+            )
+            self.assertTrue(ok)
+            self.assertEqual(kinds, {"type_checking"})
+
+        ok, _ = _check(
+            "import other as t\nif t.TYPE_CHECKING:\n    A = 1\n",
+            "import other as t\nif t.TYPE_CHECKING:\n    A = 2\n",
+        )
+        self.assertFalse(ok)
+        ok, _ = _check("X = False\nif X:\n    A = 1\n", "X = False\nif X:\n    A = 2\n")
+        self.assertFalse(ok)
+
         p_fix = "diff --git a/tests/fixtures/foo.sql b/tests/fixtures/foo.sql\n--- a/tests/fixtures/foo.sql\n+++ b/tests/fixtures/foo.sql\n@@ -1 +1 @@\n-a\n+b\n"
         self.assertEqual(eng.select_commit(p_fix), {2})
 
@@ -326,6 +540,9 @@ class SelectorUnitTests(unittest.TestCase):
             "+    KEYWORDS = {'a': 2}\n"
         )
         selector.DISABLED.discard("empty_guard")
+        # Under dict_zero_trust, confirmed 0-reader tracked dict suppresses empty_guard; disabling dict_zero_trust restores it.
+        self.assertEqual(eng.select_commit(p), set())
+        selector.DISABLED.add("dict_zero_trust")
         # Pending entry is recorded when apply_empty_guard=False; select_commit(apply_empty_guard=True) applies it.
         self.assertEqual(eng.select_commit(p, apply_empty_guard=False), set())
         self.assertIn("sqlglot/mod_a.py", eng._empty_guard_pending)
@@ -356,6 +573,7 @@ class SelectorUnitTests(unittest.TestCase):
             "     def compute(self, x):\n"
             "         return x\n"
         )
+        selector.DISABLED.add("decorator_removal_narrow")
         self.assertEqual(eng.select_commit(p), {0, 1, 2})
         selector.DISABLED.add("decorator_import_time")
         self.assertEqual(eng.select_commit(p), {0})
@@ -375,8 +593,9 @@ class SelectorUnitTests(unittest.TestCase):
         )
         self.assertIn(3, eng.select_commit(p_bad_hunk))
 
-        # 2) New module added under sqlglot/ picks up pkg_walkers + sibling lazy_test_importers
+        # 2) New module added under sqlglot/ picks up pkg_walkers + sibling lazy_test_importers (when not added-narrowed)
         eng.lazy_test_importers["sqlglot/typing/existing.py"] = ["tests/test_beta.py"]
+        eng.known_words = frozenset({"zz_new"})
         p_new = (
             "diff --git a/sqlglot/typing/zz_new.py b/sqlglot/typing/zz_new.py\n"
             "new file mode 100644\n"
@@ -704,6 +923,306 @@ class SelectorUnitTests(unittest.TestCase):
             "+        assert w == 1\n"
         )
         self.assertEqual(eng.select_commit(p_test), {0})
+
+    def test_v6_import_trigger_rule(self) -> None:
+        eng = _make_mini_engine()
+        src = (
+            "class Widget:\n"
+            "    def compute(self, x):\n"
+            "        if x > 0:\n"
+            "            return x + 1\n"
+            "        return 0\n"
+            "def helper():\n"
+            "    return 42\n"
+        )
+        eng._ast_cache["sqlglot/mod_a.py"] = (src, ast.parse(src))
+        eng.raw_line_cov["sqlglot/mod_a.py"] = {"4": [0], "7": [3]}
+        eng.import_trigger_lines = {"sqlglot/mod_a.py": {6: ["sqlglot/mod_b.py"], 7: ["sqlglot/mod_b.py"]}}
+        eng.rev_imports["sqlglot/mod_b.py"] = ["tests/test_beta.py"]
+        eng._line_cache.clear()
+        p = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -6,2 +6,2 @@\n"
+            " def helper():\n"
+            "-    return 42\n"
+            "+    return 43\n"
+        )
+        # With import_trigger enabled, helper() keeps runtime cov {3} and adds mod_b's importer test {2} (no mod_a nuclear escalation {0, 1}).
+        self.assertEqual(eng.select_commit(p), {2, 3})
+        # With import_trigger disabled, falls back to once_escalation -> mod_a users + importers {0, 1, 2, 3}.
+        selector.DISABLED.add("import_trigger")
+        self.assertEqual(eng.select_commit(p), {0, 1, 2, 3})
+
+    def test_v6_dict_zero_trust_rule(self) -> None:
+        eng = _make_mini_engine()
+        src = "class Widget:\n    KEYWORDS = {'a': 1}\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src, ast.parse(src))
+        eng.tracked_dict_classes = {"sqlglot/mod_a.py::Widget"}
+        eng.raw_dict_key_usage = {"KEYWORDS": {"sqlglot/mod_a.py::Widget": {"str:b": [0]}}}
+        p = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " class Widget:\n"
+            "-    KEYWORDS = {'a': 1}\n"
+            "+    KEYWORDS = {'a': 2}\n"
+        )
+        # Zero readers with no __all__ and not in unsafe/str_const -> trusted 0-test selection (no empty_guard).
+        self.assertEqual(eng.select_commit(p), set())
+
+        # Unsafe import-value read -> keeps empty_guard ({1, 2}).
+        eng.dict_value_import_reads = frozenset({"KEYWORDS"})
+        self.assertEqual(eng.select_commit(p), {1, 2})
+        eng.dict_value_import_reads = frozenset()
+
+        # String constant mention -> keeps empty_guard ({1, 2}).
+        eng.str_const_idents = frozenset({"KEYWORDS"})
+        self.assertEqual(eng.select_commit(p), {1, 2})
+        eng.str_const_idents = frozenset()
+
+        # Whole-dict __all__ reader -> selected directly ({3}).
+        eng.raw_dict_key_usage["KEYWORDS"]["sqlglot/mod_a.py::Widget"]["__all__"] = [3]
+        self.assertEqual(eng.select_commit(p), {3})
+
+    def test_v6_added_module_narrow_rule(self) -> None:
+        eng = _make_mini_engine()
+        eng._ast_cache["sqlglot/mod_a.py"] = ("import os\n", ast.parse("import os\n"))
+        eng.known_words = frozenset({"existing_mod"})
+        eng.lazy_test_importers["sqlglot/typing/foo.py"] = ["tests/test_beta.py"]
+
+        def _added_patch(name: str, extra: str = "") -> str:
+            return (
+                f"diff --git a/sqlglot/typing/{name}.py b/sqlglot/typing/{name}.py\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                f"+++ b/sqlglot/typing/{name}.py\n"
+                "@@ -0,0 +1 @@\n"
+                "+X = 1\n"
+            ) + extra
+
+        # Unknown stem -> narrows to pkg_walkers {3} only (drops lazy sibling test 2).
+        self.assertEqual(eng.select_commit(_added_patch("brand_new_xyz")), {3})
+        # Known stem -> escalates to {2, 3}.
+        self.assertEqual(eng.select_commit(_added_patch("existing_mod")), {2, 3})
+        # Referenced in another section's added lines -> escalates to {2, 3}.
+        extra_ref = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -1 +1,2 @@\n"
+            "+# import brand_new_xyz\n"
+            " import os\n"
+        )
+        self.assertEqual(eng.select_commit(_added_patch("brand_new_xyz", extra_ref)), {2, 3})
+
+    def test_v6_decorator_removal_narrow_rule(self) -> None:
+        eng = _make_mini_engine()
+        src_bare = "class Widget:\n    @my_dec\n    def compute(self, x):\n        return x\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src_bare, ast.parse(src_bare))
+        eng.raw_line_cov["sqlglot/mod_a.py"] = {"2": [0], "3": [0], "4": [0]}
+        eng.lazy_test_importers = {"sqlglot/mod_a.py": ["tests/test_beta.py"]}
+        eng._line_cache.clear()
+        p_bare = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -1,4 +1,3 @@\n"
+            " class Widget:\n"
+            "-    @my_dec\n"
+            "     def compute(self, x):\n"
+            "         return x\n"
+        )
+        self.assertEqual(eng.select_commit(p_bare), {0})
+
+        # Decorator Call removal does NOT narrow.
+        src_call = "class Widget:\n    @my_dec(1)\n    def compute(self, x):\n        return x\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src_call, ast.parse(src_call))
+        p_call = p_bare.replace("@my_dec", "@my_dec(1)")
+        self.assertEqual(eng.select_commit(p_call), {0, 1, 2})
+
+        # Adding a decorator does NOT narrow.
+        src_none = "class Widget:\n    def compute(self, x):\n        return x\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src_none, ast.parse(src_none))
+        p_add = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -1,3 +1,4 @@\n"
+            " class Widget:\n"
+            "+    @my_dec\n"
+            "     def compute(self, x):\n"
+            "         return x\n"
+        )
+        self.assertEqual(eng.select_commit(p_add), {0, 1, 2})
+
+        # Removing @property does NOT narrow.
+        src_prop = "class Widget:\n    @property\n    def compute(self):\n        return 1\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (src_prop, ast.parse(src_prop))
+        p_prop = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -1,4 +1,3 @@\n"
+            " class Widget:\n"
+            "-    @property\n"
+            "     def compute(self):\n"
+            "         return 1\n"
+        )
+        self.assertEqual(eng.select_commit(p_prop), {0, 1, 2})
+
+    def test_v6_noop_notop_and_type_checking(self) -> None:
+        def _cmp_site(src: str) -> tuple[int, int, int, int]:
+            for n in ast.walk(ast.parse(src)):
+                if isinstance(n, ast.Compare):
+                    return (n.lineno, n.col_offset, n.end_lineno or n.lineno, n.end_col_offset or n.col_offset)
+            raise AssertionError("no Compare")
+
+        def _check(old_s: str, new_s: str, *, use_safe: bool = False) -> tuple[bool, set[str]]:
+            om = ast.parse(old_s)
+            nm = ast.parse(new_s)
+            tc1, al1 = selector._typing_guard_info(om)
+            tc2, al2 = selector._typing_guard_info(nm)
+            sites = frozenset({_cmp_site(old_s)}) if use_safe else frozenset()
+            ctx = selector._SemEqCtx(
+                safe_sites=sites,
+                allow_opswap=True,
+                allow_notop=True,
+                allow_tc=True,
+                has_from_tc=tc1 and tc2,
+                typing_aliases=frozenset(al1 & al2),
+            )
+            ok = selector._sem_eq(om, nm, ctx)
+            return ok, set(ctx.kinds)
+
+        # notop: is / is not and in / not in (both directions)
+        for old_e, new_e in [
+            ("not (x is y)", "x is not y"),
+            ("x is not y", "not (x is y)"),
+            ("not (x in y)", "x not in y"),
+            ("x not in y", "not (x in y)"),
+        ]:
+            ok, kinds = _check(f"def f(x, y):\n    return {old_e}\n", f"def f(x, y):\n    return {new_e}\n")
+            self.assertTrue(ok, f"{old_e} <-> {new_e}")
+            self.assertEqual(kinds, {"notop"})
+
+        # notop: == / != requires safe site
+        ok, kinds = _check("def f(x, y):\n    return not (x == y)\n", "def f(x, y):\n    return x != y\n", use_safe=True)
+        self.assertTrue(ok)
+        self.assertEqual(kinds, {"notop"})
+        ok, _ = _check("def f(x, y):\n    return not (x == y)\n", "def f(x, y):\n    return x != y\n", use_safe=False)
+        self.assertFalse(ok)
+
+        # TYPE_CHECKING: valid guards vs non-typing / arbitrary name
+        for hdr, tst in [
+            ("from typing import TYPE_CHECKING\n", "TYPE_CHECKING"),
+            ("import typing as t\n", "t.TYPE_CHECKING"),
+            ("", "False"),
+        ]:
+            ok, kinds = _check(
+                f"{hdr}if {tst}:\n    from sqlglot import exp\nX = 1\n",
+                f"{hdr}if {tst}:\n    from sqlglot import parser\nX = 1\n",
+            )
+            self.assertTrue(ok)
+            self.assertEqual(kinds, {"type_checking"})
+
+        ok, _ = _check(
+            "import other as t\nif t.TYPE_CHECKING:\n    A = 1\n",
+            "import other as t\nif t.TYPE_CHECKING:\n    A = 2\n",
+        )
+        self.assertFalse(ok)
+        ok, _ = _check("X = False\nif X:\n    A = 1\n", "X = False\nif X:\n    A = 2\n")
+        self.assertFalse(ok)
+
+    def test_v6b_enum_dict_key_normalization(self) -> None:
+        class MyIntEnum(enum.IntEnum):
+            AUTO_INCREMENT = 7
+
+        class MyStrEnum(str, enum.Enum):
+            INT = "int_val"
+
+        class MyFlag(enum.IntFlag):
+            A = 1
+            B = 2
+
+        self.assertEqual(build_maps._norm_dict_key(MyIntEnum.AUTO_INCREMENT), "enum:MyIntEnum.AUTO_INCREMENT")
+        self.assertEqual(build_maps._norm_dict_key(MyStrEnum.INT), "enum:MyStrEnum.INT")
+        self.assertEqual(
+            build_maps._norm_dict_key((MyIntEnum.AUTO_INCREMENT, "x")),
+            "tuple:(enum:MyIntEnum.AUTO_INCREMENT,str:x)",
+        )
+        self.assertEqual(build_maps._norm_dict_key(42), "int:42")
+        self.assertEqual(build_maps._norm_dict_key("abc"), "str:abc")
+        self.assertIsNone(build_maps._norm_dict_key(MyFlag.A | MyFlag.B))
+        self.assertIsNone(build_maps._norm_dict_key(MyFlag(4)))
+
+    def test_v6b_defensive_enum_lookup_fallback(self) -> None:
+        eng = _make_mini_engine()
+        src = (
+            "class Widget:\n"
+            "    TOKEN_MAPPING = {\n"
+            "        TokenType.AUTO_INCREMENT: 'GENERATED BY DEFAULT AS IDENTITY',\n"
+            "        TokenType.VAR: 'VARCHAR',\n"
+            "    }\n"
+        )
+        eng._ast_cache["sqlglot/mod_a.py"] = (src, ast.parse(src))
+        eng.tracked_dict_classes.add("sqlglot/mod_a.py::Widget")
+        eng.raw_dict_key_usage["TOKEN_MAPPING"] = {
+            "sqlglot/mod_a.py::Widget": {
+                "int:TokenType.AUTO_INCREMENT": [2],
+                "enum:TokenType.VAR": [1],
+            }
+        }
+        patch = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -1,5 +1,5 @@\n"
+            " class Widget:\n"
+            "     TOKEN_MAPPING = {\n"
+            "-        TokenType.AUTO_INCREMENT: 'GENERATED BY DEFAULT AS IDENTITY',\n"
+            "+        TokenType.AUTO_INCREMENT: 'AUTOINCREMENT',\n"
+            "         TokenType.VAR: 'VARCHAR',\n"
+            "     }\n"
+        )
+        self.assertEqual(eng.select_commit(patch), {2})
+
+    def test_v6b_dict_key_mismatch_attrs_blocks_zero_trust(self) -> None:
+        eng = _make_mini_engine()
+        src = (
+            "class Widget:\n"
+            "    WEIRD_MAP = {\n"
+            "        'dead': 1,\n"
+            "        'live': 2,\n"
+            "    }\n"
+        )
+        eng._ast_cache["sqlglot/mod_a.py"] = (src, ast.parse(src))
+        eng.tracked_dict_classes.add("sqlglot/mod_a.py::Widget")
+        eng.raw_dict_key_usage["WEIRD_MAP"] = {
+            "sqlglot/mod_a.py::Widget": {
+                "str:live": [1],
+            }
+        }
+        patch = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -1,5 +1,5 @@\n"
+            " class Widget:\n"
+            "     WEIRD_MAP = {\n"
+            "-        'dead': 1,\n"
+            "+        'dead': 9,\n"
+            "         'live': 2,\n"
+            "     }\n"
+        )
+        # Without WEIRD_MAP in dict_key_mismatch_attrs, dict_zero_trust skips empty_guard -> set().
+        self.assertEqual(eng.select_commit(patch), set())
+        # With WEIRD_MAP flagged in dict_key_mismatch_attrs, empty_guard must fire.
+        eng.dict_key_mismatch_attrs = frozenset({"WEIRD_MAP"})
+        selected = eng.select_commit(patch)
+        self.assertEqual(selected, {1, 2})
 
 
 if __name__ == "__main__":

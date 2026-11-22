@@ -14,7 +14,7 @@ import sys
 import zlib
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
 
 DATA_DIR = Path(os.environ.get("BLAST_DATA_DIR", "/data"))
 DEFAULT_SRC = Path(__file__).resolve().parent / "sqlglot_src"
@@ -273,13 +273,79 @@ def _is_allowed_opswap_operand(node: ast.AST) -> bool:
     return False
 
 
+def _typing_guard_info(mod: ast.Module) -> Tuple[bool, Set[str]]:
+    """Detect top-level TYPE_CHECKING and typing module aliases not shadowed at module scope."""
+    has_from_tc = False
+    aliases: Set[str] = set()
+    shadowed: Set[str] = set()
+    for stmt in mod.body:
+        if isinstance(stmt, ast.ImportFrom):
+            if stmt.level == 0 and stmt.module == "typing":
+                for al in stmt.names:
+                    bound = al.asname or al.name
+                    if al.name == "TYPE_CHECKING" and bound == "TYPE_CHECKING":
+                        has_from_tc = True
+                    else:
+                        shadowed.add(bound)
+            else:
+                for al in stmt.names:
+                    shadowed.add(al.asname or al.name)
+        elif isinstance(stmt, ast.Import):
+            for al in stmt.names:
+                bound = al.asname or al.name.split(".", 1)[0]
+                if al.name == "typing" and (al.asname or al.name == "typing"):
+                    aliases.add(al.asname or "typing")
+                else:
+                    shadowed.add(bound)
+        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            shadowed.add(stmt.name)
+        elif isinstance(stmt, ast.Assign):
+            for tgt in stmt.targets:
+                if isinstance(tgt, ast.Name):
+                    shadowed.add(tgt.id)
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            shadowed.add(stmt.target.id)
+    if "TYPE_CHECKING" in shadowed:
+        has_from_tc = False
+    aliases -= shadowed
+    return has_from_tc, aliases
+
+
+def _node_site(node: ast.AST) -> Tuple[int, int, int, int]:
+    ln = getattr(node, "lineno", 0) or 0
+    col = getattr(node, "col_offset", 0) or 0
+    eln = getattr(node, "end_lineno", None) or ln
+    ecol = getattr(node, "end_col_offset", None) or col
+    return (ln, col, eln, ecol)
+
+
+def _is_tc_test(test: ast.AST, ctx: "_SemEqCtx") -> bool:
+    if isinstance(test, ast.Constant):
+        return test.value is False or (type(test.value) is int and test.value == 0)
+    if not ctx.frames or ctx.frames[-1] is None:
+        if isinstance(test, ast.Name) and test.id == "TYPE_CHECKING" and ctx.has_from_tc:
+            return True
+        if (
+            isinstance(test, ast.Attribute)
+            and isinstance(test.value, ast.Name)
+            and test.attr == "TYPE_CHECKING"
+            and test.value.id in ctx.typing_aliases
+        ):
+            return True
+    return False
+
+
 class _SemEqCtx:
     __slots__ = (
         "safe_sites",
         "allow_opswap",
         "allow_alpha",
         "allow_ann",
+        "allow_notop",
+        "allow_tc",
         "future_ann",
+        "has_from_tc",
+        "typing_aliases",
         "old_lines",
         "new_lines",
         "frames",
@@ -293,7 +359,11 @@ class _SemEqCtx:
         allow_opswap: bool = True,
         allow_alpha: bool = True,
         allow_ann: bool = True,
+        allow_notop: bool = True,
+        allow_tc: bool = True,
         future_ann: bool = False,
+        has_from_tc: bool = False,
+        typing_aliases: FrozenSet[str] = frozenset(),
         old_lines: Optional[List[str]] = None,
         new_lines: Optional[List[str]] = None,
     ) -> None:
@@ -301,7 +371,11 @@ class _SemEqCtx:
         self.allow_opswap = allow_opswap
         self.allow_alpha = allow_alpha
         self.allow_ann = allow_ann
+        self.allow_notop = allow_notop
+        self.allow_tc = allow_tc
         self.future_ann = future_ann
+        self.has_from_tc = has_from_tc
+        self.typing_aliases = typing_aliases
         self.old_lines = old_lines
         self.new_lines = new_lines
         self.frames: List[Optional[Tuple[frozenset[str], frozenset[str], Dict[str, str], Dict[str, str]]]] = []
@@ -347,6 +421,34 @@ def _sem_eq(a: Any, b: Any, ctx: _SemEqCtx) -> bool:
     """Bounded semantic-equivalence AST comparator for verified-safe no-op edits."""
     if a is b:
         return True
+
+    if ctx.allow_notop:
+        if isinstance(a, ast.UnaryOp) and isinstance(a.op, ast.Not) and isinstance(b, ast.Compare):
+            ua, cb = a.operand, b
+        elif isinstance(b, ast.UnaryOp) and isinstance(b.op, ast.Not) and isinstance(a, ast.Compare):
+            ua, cb = a, b.operand
+        else:
+            ua, cb = None, None
+        if ua is not None and isinstance(ua, ast.Compare) and isinstance(cb, ast.Compare):
+            if len(ua.ops) == 1 and len(cb.ops) == 1 and len(ua.comparators) == 1 and len(cb.comparators) == 1:
+                op1, op2 = type(ua.ops[0]), type(cb.ops[0])
+                pair = {op1, op2}
+                if op1 is not op2 and pair in ({ast.Is, ast.IsNot}, {ast.In, ast.NotIn}):
+                    if _sem_eq(ua.left, cb.left, ctx) and _sem_eq(ua.comparators[0], cb.comparators[0], ctx):
+                        ctx.kinds.add("notop")
+                        return True
+                    return False
+                if op1 is not op2 and pair == {ast.Eq, ast.NotEq}:
+                    if (
+                        ctx.allow_opswap
+                        and _node_site(ua) in ctx.safe_sites
+                        and _sem_eq(ua.left, cb.left, ctx)
+                        and _sem_eq(ua.comparators[0], cb.comparators[0], ctx)
+                    ):
+                        ctx.kinds.add("notop")
+                        return True
+                    return False
+
     if type(a) is not type(b):
         return False
 
@@ -495,6 +597,14 @@ def _sem_eq(a: Any, b: Any, ctx: _SemEqCtx) -> bool:
         finally:
             ctx.frames.pop()
 
+    elif isinstance(a, ast.If):
+        if ctx.allow_tc and _ast_eq(a.test, b.test) and _is_tc_test(a.test, ctx):
+            if not _sem_eq(a.orelse, b.orelse, ctx):
+                return False
+            if not _ast_eq(a.body, b.body):
+                ctx.kinds.add("type_checking")
+            return True
+
     elif isinstance(a, ast.AnnAssign):
         if ctx.allow_ann and ctx.scope_kind == "function" and a.simple and b.simple and isinstance(a.target, ast.Name) and isinstance(b.target, ast.Name):
             if not (_sem_eq(a.target, b.target, ctx) and _sem_eq(a.value, b.value, ctx)):
@@ -516,6 +626,28 @@ def _sem_eq(a: Any, b: Any, ctx: _SemEqCtx) -> bool:
             return False
         return all(_sem_eq(x, y, ctx) for x, y in zip(a, b))
     return a == b and type(a) is type(b)
+
+
+_DANGEROUS_REMOVED_DECORATORS = frozenset({
+    "property",
+    "cached_property",
+    "classmethod",
+    "staticmethod",
+    "abstractmethod",
+    "dataclass",
+    "setter",
+    "getter",
+    "deleter",
+    "wraps",
+})
+
+
+def _decorator_terminal_name(node: ast.AST) -> Optional[str]:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
 
 
 def _diff_touches_dunder_eq(raw_diff: str) -> bool:
@@ -1115,6 +1247,14 @@ class SelectorEngine:
         self.collection_lines: Dict[str, Dict[int, List[str]]] = {
             rp: {int(ln): list(tfs) for ln, tfs in lmap.items()} for rp, lmap in raw_col.items()
         }
+        raw_trig = maps.get("import_trigger_lines", {})
+        self.import_trigger_lines: Dict[str, Dict[int, List[str]]] = {
+            rp: {int(ln): list(trigs) for ln, trigs in lmap.items()} for rp, lmap in raw_trig.items()
+        }
+        self.dict_value_import_reads: FrozenSet[str] = frozenset(maps.get("dict_value_import_reads", ()))
+        self.str_const_idents: FrozenSet[str] = frozenset(maps.get("str_const_idents", ()))
+        self.known_words: FrozenSet[str] = frozenset(maps.get("known_words", ()))
+        self.dict_key_mismatch_attrs: FrozenSet[str] = frozenset(maps.get("dict_key_mismatch_attrs", ()))
         self.path_mentions: Dict[str, List[str]] = maps.get("path_mentions", {})
         self.lazy_test_importers: Dict[str, List[str]] = maps.get("lazy_test_importers", {})
         raw_eq_safe = maps.get("eq_safe_sites", {})
@@ -1125,8 +1265,12 @@ class SelectorEngine:
         self.eq_sites_stats: Dict[str, Any] = maps.get("eq_sites_stats", {})
         self.subprocess_test_ids: List[str] = list(maps.get("subprocess_test_ids", ()))
         self._subprocess_livemask: Optional[int] = None
-        self._once_cache: Dict[str, frozenset] = {}
+        self._once_cache: Dict[Tuple[bool, str], frozenset] = {}
         self._pkg_lazy_cache: Dict[str, int] = {}
+        self._mod_users_cache: Dict[str, Tuple[int, int]] = {}
+        self._marks: int = 0
+        self._trusted_marks: int = 0
+        self._other_added_text: str = ""
 
         self._trace: bool = TRACE
         self.reasons: List[str] = []
@@ -1228,7 +1372,20 @@ class SelectorEngine:
         if not by_cls:
             return 0
         raw = by_cls.get(norm_key)
-        return self._to_mask(raw) if raw else 0
+        mask = self._to_mask(raw) if raw else 0
+        if norm_key.startswith("enum:"):
+            suffix = norm_key[5:]
+            for pfx in ("int:", "str:"):
+                alt = by_cls.get(pfx + suffix)
+                if alt:
+                    mask |= self._to_mask(alt)
+        elif norm_key.startswith("tuple:") and "enum:" in norm_key:
+            for pfx in ("int:", "str:"):
+                alt_k = norm_key.replace("enum:", pfx)
+                alt = by_cls.get(alt_k)
+                if alt:
+                    mask |= self._to_mask(alt)
+        return mask
 
     def _attr_reader_mask(self, attr: str) -> int:
         cached = self._attr_reader_cache.get(attr)
@@ -1432,10 +1589,17 @@ class SelectorEngine:
 
     def _touches_once_lines(self, rel_path: str, lines: Sequence[int], fn_root: Optional[ast.AST]) -> bool:
         """True if any changed line inside fn_root's *body* only ever runs once per process."""
-        once = self._once_cache.get(rel_path)
+        it_on = self._rule_enabled("import_trigger")
+        cache_k = (it_on, rel_path)
+        once = self._once_cache.get(cache_k)
         if once is None:
-            once = frozenset(self.raw_once_lines.get(rel_path, ()))
-            self._once_cache[rel_path] = once
+            s = set(self.raw_once_lines.get(rel_path, ()))
+            if not it_on:
+                tmap = self.import_trigger_lines.get(rel_path)
+                if tmap:
+                    s.update(tmap.keys())
+            once = frozenset(s)
+            self._once_cache[cache_k] = once
         if not once:
             return False
         lo = 0
@@ -1446,6 +1610,53 @@ class SelectorEngine:
             lo = first.lineno  # def / decorator / default-arg lines are import-time by nature: ignore
         return any(ln >= lo and ln in once for ln in lines)
 
+    def _module_users_cheap(self, rel_path: str) -> Tuple[int, int]:
+        cached = self._mod_users_cache.get(rel_path)
+        if cached is not None:
+            return cached
+        base = (
+            self._file_access(rel_path)
+            | self._dir_walker_tests(rel_path)
+            | self._pkg_walker_tests(rel_path)
+            | self._module_cov(rel_path)
+            | self._mod_classes_usage_mask(rel_path, None)
+        )
+        for link_cls in self.dialect_typing_links.get(rel_path, ()):
+            base |= self._class_usage(link_cls)
+        live = self._importer_test_livemask(rel_path) | self._lazy_test_livemask(rel_path)
+        if rel_path == "sqlglot/__init__.py":
+            live |= self.all_livemask
+        cached = (base, live)
+        self._mod_users_cache[rel_path] = cached
+        return cached
+
+    def _import_trigger_mask(self, rel_path: str, lines: Iterable[int], fn_root: Optional[ast.AST]) -> Tuple[int, int]:
+        tmap = self.import_trigger_lines.get(rel_path)
+        if not tmap:
+            return 0, 0
+        lo = 0
+        if isinstance(fn_root, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn_root.body:
+            first = fn_root.body[0]
+            if _is_docstring_stmt(first) and len(fn_root.body) > 1:
+                first = fn_root.body[1]
+            lo = first.lineno
+        trigs_hit: Set[str] = set()
+        for ln in lines:
+            if ln >= lo:
+                trigs = tmap.get(ln)
+                if trigs:
+                    trigs_hit.update(trigs)
+        if not trigs_hit:
+            return 0, 0
+        tb, tl = 0, 0
+        for trig in sorted(trigs_hit):
+            mb, ml = self._module_users_cheap(trig)
+            tb |= mb
+            tl |= ml
+        if self._trace and (tb | tl):
+            self._note(f"import_trigger:{rel_path}")
+        return tb, tl
+
     def _lines_with_fallback(
         self,
         rel_path: str,
@@ -1455,30 +1666,32 @@ class SelectorEngine:
         old_mod: Optional[ast.Module],
     ) -> Tuple[int, int]:
         lines = list(lines)
+        itb, itl = self._import_trigger_mask(rel_path, lines, old_fn_root) if self._rule_enabled("import_trigger") else (0, 0)
         if self._touches_once_lines(rel_path, lines, old_fn_root):
             # Once-per-process code (metaclass / __init_subclass__ hooks, factory outer bodies, memoized
             # builders): per-test coverage only credits the first test that triggered it.
             b, l = self._once_escalation(rel_path, old_mod)
-            return b | self._lines_cov(rel_path, lines), l
+            return b | self._lines_cov(rel_path, lines) | itb, l | itl
         m = self._lines_cov(rel_path, lines)
         if m:
             if self._trace:
                 self._note(f"cov:{rel_path}")
-            return m, 0
+            return m | itb, itl
         fn0, fn1 = _stmt_span(old_fn_root)
         m = self._lines_cov(rel_path, range(fn0, fn1 + 1))
         if m:
             if self._trace:
                 self._note(f"fn_fallback:{rel_path}")
-            return m, 0
+            return m | itb, itl
         if cls_stack:
             ck = self._cls_key(rel_path, cls_stack)
             m = self._class_usage(ck)
             if m:
                 if self._trace:
                     self._note(f"cls_usage:{ck}")
-                return m, 0
-        return self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+                return m | itb, itl
+        fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
+        return fb | itb, fl | itl
 
     def _diff_fn_bodies(
         self,
@@ -1674,6 +1887,53 @@ class SelectorEngine:
 
         return base, live
 
+    def _try_narrow_decorator_removal(
+        self,
+        os_: ast.AST,
+        ns_: ast.AST,
+        rel_path: str,
+    ) -> Optional[Tuple[int, int]]:
+        if not self._rule_enabled("decorator_removal_narrow"):
+            return None
+        if not isinstance(os_, (ast.FunctionDef, ast.AsyncFunctionDef)) or type(os_) is not type(ns_):
+            return None
+        if os_.name != ns_.name:
+            return None
+        old_decs = os_.decorator_list
+        new_decs = ns_.decorator_list
+        if len(new_decs) >= len(old_decs):
+            return None
+        j = 0
+        removed: List[ast.expr] = []
+        for d in old_decs:
+            if j < len(new_decs) and _ast_eq(d, new_decs[j]):
+                j += 1
+            else:
+                removed.append(d)
+        if j != len(new_decs) or not removed:
+            return None
+        for d in removed:
+            tname = _decorator_terminal_name(d)
+            if tname is None or tname in _DANGEROUS_REMOVED_DECORATORS:
+                return None
+        if not (
+            _ast_eq(os_.args, ns_.args)
+            and _ast_eq(os_.returns, ns_.returns)
+            and _ast_list_eq(getattr(os_, "type_params", []), getattr(ns_, "type_params", []))
+            and getattr(os_, "type_comment", None) == getattr(ns_, "type_comment", None)
+            and _ast_list_eq(os_.body, ns_.body)
+        ):
+            return None
+        s0, s1 = _stmt_span(os_)
+        fn_lines = range(s0, s1 + 1)
+        cov = self._lines_cov(rel_path, fn_lines)
+        if not cov:
+            return None
+        itb, itl = self._import_trigger_mask(rel_path, fn_lines, os_) if self._rule_enabled("import_trigger") else (0, 0)
+        if self._trace:
+            self._note(f"decorator_narrow:{rel_path}")
+        return cov | itb, itl
+
     def _diff_scope_stmts(
         self,
         old_stmts: List[ast.stmt],
@@ -1697,6 +1957,7 @@ class SelectorEngine:
         dec_enabled = self._rule_enabled("decorator_import_time")
 
         def _mark_scope() -> None:
+            self._marks += 1
             if cls_stack:
                 if changed_classes is not None:
                     changed_classes.add(self._cls_key(rel_path, cls_stack))
@@ -1754,37 +2015,49 @@ class SelectorEngine:
                         fn_lines = range(s0, s1 + 1)
                         dec_diff = not _ast_list_eq(os_.decorator_list, ns_.decorator_list)
                         if dec_diff and dec_enabled:
-                            cov = self._lines_cov(rel_path, fn_lines)
-                            fb, fl = self._once_escalation(rel_path, old_mod)
-                            base |= cov | fb
-                            live |= fl
-                            if self._trace:
-                                self._note(f"decorator:{rel_path}")
-                        elif _fn_signature_changed(os_, ns_) or _fn_scope_shape(os_) != _fn_scope_shape(ns_):
-                            cov = self._lines_cov(rel_path, fn_lines)
-                            if cov and self._touches_once_lines(rel_path, fn_lines, os_):
+                            narrow = self._try_narrow_decorator_removal(os_, ns_, rel_path)
+                            if narrow is not None:
+                                base |= narrow[0]
+                                live |= narrow[1]
+                            else:
+                                cov = self._lines_cov(rel_path, fn_lines)
                                 fb, fl = self._once_escalation(rel_path, old_mod)
                                 base |= cov | fb
                                 live |= fl
+                                if self._trace:
+                                    self._note(f"decorator:{rel_path}")
+                        elif _fn_signature_changed(os_, ns_) or _fn_scope_shape(os_) != _fn_scope_shape(ns_):
+                            itb, itl = (
+                                self._import_trigger_mask(rel_path, fn_lines, os_)
+                                if self._rule_enabled("import_trigger")
+                                else (0, 0)
+                            )
+                            cov = self._lines_cov(rel_path, fn_lines)
+                            if cov and self._touches_once_lines(rel_path, fn_lines, os_):
+                                fb, fl = self._once_escalation(rel_path, old_mod)
+                                base |= cov | fb | itb
+                                live |= fl | itl
                             elif cov:
-                                base |= cov
+                                base |= cov | itb
+                                live |= itl
                                 if self._trace:
                                     self._note(f"cov:{rel_path}")
                             elif cls_stack:
                                 ck = self._cls_key(rel_path, cls_stack)
                                 cm = self._class_usage(ck)
                                 if cm:
-                                    base |= cm
+                                    base |= cm | itb
+                                    live |= itl
                                     if self._trace:
                                         self._note(f"cls_usage:{ck}")
                                 else:
                                     fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
-                                    base |= fb
-                                    live |= fl
+                                    base |= fb | itb
+                                    live |= fl | itl
                             else:
                                 fb, fl = self._module_wide_fallback(rel_path, old_mod, include_importers=True)
-                                base |= fb
-                                live |= fl
+                                base |= fb | itb
+                                live |= fl | itl
                         else:
                             b, l = self._diff_fn_bodies(
                                 os_.body, ns_.body, rel_path, cls_stack, os_, old_mod, old_lines, new_lines
@@ -1805,6 +2078,11 @@ class SelectorEngine:
                     and isinstance(ns_, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
                     and not _ast_list_eq(os_.decorator_list, ns_.decorator_list)
                 ):
+                    narrow = self._try_narrow_decorator_removal(os_, ns_, rel_path)
+                    if narrow is not None:
+                        base |= narrow[0]
+                        live |= narrow[1]
+                        continue
                     fb, fl = self._once_escalation(rel_path, old_mod)
                     base |= fb
                     live |= fl
@@ -1854,10 +2132,25 @@ class SelectorEngine:
                                         base |= fb
                                         live |= fl
                                 elif modified_existing:
-                                    dk_mask = 0
+                                    dk_mask = self._dict_key_mask(attr, cls_key, "__all__")
                                     for kn in modified_existing:
                                         dk_mask |= self._dict_key_mask(attr, cls_key, kn)
                                     base |= dk_mask
+                                    if (
+                                        dk_mask == 0
+                                        and self._rule_enabled("dict_zero_trust")
+                                        and attr not in self.dict_value_import_reads
+                                        and attr not in self.str_const_idents
+                                        and attr not in self.dict_key_mismatch_attrs
+                                        and all(
+                                            isinstance(kn, str)
+                                            and kn.startswith(("str:", "int:", "enum:", "tuple:", "cls:"))
+                                            for kn in modified_existing
+                                        )
+                                    ):
+                                        self._trusted_marks += 1
+                                        if self._trace:
+                                            self._note(f"dict_zero_trusted:{attr}")
                                     if self._trace:
                                         n_dk = dk_mask.bit_count()
                                         self._note(f"dict_key_zero:{attr}" if n_dk == 0 else f"dict_key:{attr}:{n_dk}")
@@ -2121,11 +2414,32 @@ class SelectorEngine:
         raw_diff: str = "",
     ) -> Tuple[int, int]:
         self._last_ast_eq = False
+        self._marks = 0
+        self._trusted_marks = 0
         unc_enabled = self._rule_enabled("uncertainty_escalation")
 
         if status == "added":
             bm = self._dir_walker_tests(rel_path) | self._pkg_walker_tests(rel_path)
             lm = 0
+            if (
+                self._rule_enabled("added_module_narrow")
+                and rel_path.startswith("sqlglot/")
+                and not rel_path.endswith("/__init__.py")
+                and rel_path != "sqlglot/__init__.py"
+            ):
+                stem = rel_path.rsplit("/", 1)[-1][:-3] if rel_path.endswith(".py") else rel_path.rsplit("/", 1)[-1]
+                pkg = rel_path.rsplit("/", 1)[0] if "/" in rel_path else ""
+                same_pkg_other = any(
+                    p != rel_path and (p.rsplit("/", 1)[0] if "/" in p else "") == pkg for p in added_paths
+                )
+                if (
+                    stem not in self.known_words
+                    and not same_pkg_other
+                    and not (self._other_added_text and re.search(rf"\b{re.escape(stem)}\b", self._other_added_text))
+                ):
+                    if self._trace:
+                        self._note(f"added_narrow:{rel_path}")
+                    return bm | self._file_access(rel_path), 0
             if unc_enabled and rel_path.startswith("sqlglot/"):
                 pkg = rel_path.rsplit("/", 1)[0] if "/" in rel_path else ""
                 lm |= self._pkg_sibling_lazy_livemask(pkg)
@@ -2204,12 +2518,18 @@ class SelectorEngine:
                 and self._last_num_sections == 1
                 and not _diff_touches_dunder_eq(raw_diff)
             )
+            tc_old, al_old = _typing_guard_info(old_mod)
+            tc_new, al_new = _typing_guard_info(new_mod)
             sem_ctx = _SemEqCtx(
                 safe_sites=self.eq_safe_sites.get(rel_path, frozenset()),
                 allow_opswap=allow_opswap,
                 allow_alpha=self._rule_enabled("noop_alpha"),
                 allow_ann=self._rule_enabled("noop_annotation"),
+                allow_notop=self._rule_enabled("noop_notop"),
+                allow_tc=self._rule_enabled("noop_type_checking"),
                 future_ann=_has_future_annotations(old_mod) and _has_future_annotations(new_mod),
+                has_from_tc=tc_old and tc_new,
+                typing_aliases=frozenset(al_old & al_new),
                 old_lines=old_lines,
                 new_lines=new_lines,
             )
@@ -2248,16 +2568,17 @@ class SelectorEngine:
         tot_l = live | dl
 
         if rel_path.startswith("sqlglot/") and (tot_b | tot_l) == 0:
-            eb, el = 0, 0
-            if mod_change_flag[0] or not changed_classes:
-                eb, el = self._module_wide_fallback(rel_path, old_mod, include_importers=False)
-            else:
-                for ck in sorted(changed_classes):
-                    eb |= self._class_usage(ck)
-                if (eb | el) == 0:
+            if not (self._marks > 0 and self._marks == self._trusted_marks):
+                eb, el = 0, 0
+                if mod_change_flag[0] or not changed_classes:
                     eb, el = self._module_wide_fallback(rel_path, old_mod, include_importers=False)
-            if eb or el:
-                self._empty_guard_pending[rel_path] = (eb, el, raw_diff)
+                else:
+                    for ck in sorted(changed_classes):
+                        eb |= self._class_usage(ck)
+                    if (eb | el) == 0:
+                        eb, el = self._module_wide_fallback(rel_path, old_mod, include_importers=False)
+                if eb or el:
+                    self._empty_guard_pending[rel_path] = (eb, el, raw_diff)
 
         return tot_b, tot_l
 
@@ -2297,7 +2618,15 @@ class SelectorEngine:
                 if rp:
                     added_paths.add(rp)
 
-        for sec in sections:
+        sec_added_texts = [
+            "\n".join(
+                l[1:] for l in sec.get("raw_diff", "").splitlines() if l.startswith("+") and not l.startswith("+++")
+            )
+            for sec in sections
+        ]
+
+        for sec_idx, sec in enumerate(sections):
+            self._other_added_text = "\n".join(t for j, t in enumerate(sec_added_texts) if j != sec_idx and t)
             rel_path = sec["rel_path"]
             a_path = sec["a_path"]
             b_path = sec["b_path"]
