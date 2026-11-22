@@ -153,6 +153,22 @@ _INERT_NAMES = {
     ".pre-commit-config.yaml",
     ".coveragerc",
 }
+_TPCDS_EXEC_CORE_FILES: FrozenSet[str] = frozenset({
+    "sqlglot/__init__.py",
+    "sqlglot/_typing.py",
+    "sqlglot/dialects/dialect.py",
+    "sqlglot/errors.py",
+    "sqlglot/generators/python.py",
+    "sqlglot/helper.py",
+    "sqlglot/planner.py",
+    "sqlglot/schema.py",
+    "sqlglot/time.py",
+    "sqlglot/trie.py",
+})
+_TPCDS_OPT_CORE_FILES: FrozenSet[str] = frozenset({
+    "sqlglot/dialects/__init__.py",
+    "sqlglot/transforms.py",
+})
 
 
 def _encoding_cookie(text: str) -> Optional[str]:
@@ -1537,6 +1553,12 @@ class SelectorEngine:
         self._tpcds_base_bit: int = (1 << _tpcds_bidx) if _tpcds_bidx is not None else 0
         self.tpcds_exec_qids: Tuple[int, ...] = tuple(int(x) for x in maps.get("tpcds_exec_qids", ()))
         self.tpcds_digests: Dict[int, str] = {int(k): str(v) for k, v in maps.get("tpcds_digests", {}).items()}
+        self.tpcds_parse_digests: Dict[int, str] = {
+            int(k): str(v) for k, v in maps.get("tpcds_parse_digests", {}).items()
+        }
+        self.tpcds_opt_digests: Dict[int, str] = {
+            int(k): str(v) for k, v in maps.get("tpcds_opt_digests", {}).items()
+        }
         self.tpcds_query_cov: Dict[str, Dict[int, int]] = {
             rp: {int(ln): int(m) for ln, m in lm.items()} for rp, lm in maps.get("tpcds_query_cov", {}).items()
         }
@@ -3585,6 +3607,129 @@ class SelectorEngine:
             self._raw_tpcds_tables = raw_tables
         return self._raw_tpcds_tables
 
+    def _classify_tpcds_stages(self, touched_sqlglot: Set[str]) -> Tuple[bool, bool]:
+        """Return (touches_opt, touches_exec) conservatively for edited sqlglot paths."""
+        if not self.tpcds_parse_digests or not self.tpcds_opt_digests:
+            return True, True
+        touches_exec = any(
+            p.startswith(("sqlglot/executor/", "sqlglot/expressions/")) or p in _TPCDS_EXEC_CORE_FILES
+            for p in touched_sqlglot
+        )
+        touches_opt = touches_exec or any(
+            p.startswith(("sqlglot/optimizer/", "sqlglot/typing/")) or p in _TPCDS_OPT_CORE_FILES
+            for p in touched_sqlglot
+        )
+        return touches_opt, touches_exec
+
+    def _probe_tpcds(
+        self,
+        tpcds_sqls: List[Tuple[bool, str]],
+        b_exec_qids: List[int],
+        touches_opt: bool,
+        touches_exec: bool,
+        tpcds_schema: Dict[str, Dict[str, str]],
+        raw_tables: Dict[str, Tuple[Dict[str, str], List[tuple]]],
+    ) -> Tuple[bool, str]:
+        """3-stage streaming deterministic probe for test_execute_tpcds inside forked child."""
+        from sqlglot import exp, find_tables, parse_one, transpile
+        from sqlglot.executor import execute
+        from sqlglot.executor.python import Python
+        from sqlglot.executor.table import Table
+        from sqlglot.optimizer import optimize
+        from sqlglot.schema import ensure_schema
+
+        if Python().generator(identify=True, comments=False).generate(exp.var("scope")) != "scope":
+            return False, "guard"
+
+        built_tables: Optional[Dict[str, Any]] = None
+        rt = raw_tables
+
+        def _exec_one(qi: int, ast_q: Any, dk_sql: str) -> bool:
+            nonlocal built_tables, rt
+            if built_tables is None:
+                if not rt:
+                    rt = self._ensure_raw_tpcds_tables()
+                built_tables = {tn: Table(columns=cols, rows=rows) for tn, (cols, rows) in rt.items()}
+            tabs = {t.name: built_tables[t.name] for t in find_tables(ast_q)}
+            tbl = execute(ast_q, schema=tpcds_schema, tables=tabs)
+            c_cols = [str(c) for c in tbl.columns]
+            c_rows = [[_canon_cell(x) for x in r] for r in tbl.rows]
+            return _canon_digest([dk_sql, c_cols, c_rows]) == self.tpcds_digests.get(qi)
+
+        if not touches_opt:
+            exec_set = set(self.tpcds_exec_qids)
+            schema_obj: Any = None
+            used_s2 = False
+            used_s3 = False
+            try:
+                for qi, (_, sql) in enumerate(tpcds_sqls):
+                    ast_q = pickle.loads(pickle.dumps(parse_one(sql)))
+                    if not isinstance(ast_q, exp.Expr):
+                        return False, "s1"
+                    if qi in exec_set:
+                        dk_sql = transpile(sql, write="duckdb")[0]
+                        if _canon_digest([repr(ast_q), dk_sql]) == self.tpcds_parse_digests.get(qi):
+                            continue
+                        used_s2 = True
+                        if schema_obj is None:
+                            schema_obj = ensure_schema(tpcds_schema, dialect=None)
+                        opt_q = optimize(ast_q.copy(), schema_obj, leave_tables_isolated=True, dialect=None)
+                        if _canon_digest([repr(opt_q), dk_sql]) == self.tpcds_opt_digests.get(qi):
+                            continue
+                        used_s3 = True
+                        if not _exec_one(qi, ast_q, dk_sql):
+                            return False, "s1->s3"
+                return True, ("s1->s3" if used_s3 else ("s1->s2" if used_s2 else "s1"))
+            except BaseException:
+                return False, ("s1->s3" if used_s3 else ("s1->s2" if used_s2 else "s1"))
+
+        if not touches_exec:
+            used_s3 = False
+            try:
+                schema_obj = ensure_schema(tpcds_schema, dialect=None)
+                for qi in b_exec_qids:
+                    _, sql = tpcds_sqls[qi]
+                    ast_q = pickle.loads(pickle.dumps(parse_one(sql)))
+                    if not isinstance(ast_q, exp.Expr):
+                        return False, "s2"
+                    dk_sql = transpile(sql, write="duckdb")[0]
+                    opt_q = optimize(ast_q.copy(), schema_obj, leave_tables_isolated=True, dialect=None)
+                    if _canon_digest([repr(opt_q), dk_sql]) == self.tpcds_opt_digests.get(qi):
+                        continue
+                    used_s3 = True
+                    if not _exec_one(qi, ast_q, dk_sql):
+                        return False, "s2->s3"
+                exec_set = set(b_exec_qids)
+                for qi, (_, sql) in enumerate(tpcds_sqls):
+                    if qi in exec_set:
+                        continue
+                    ast_q = pickle.loads(pickle.dumps(parse_one(sql)))
+                    if not isinstance(ast_q, exp.Expr):
+                        return False, ("s2->s3" if used_s3 else "s2")
+                return True, ("s2->s3" if used_s3 else "s2")
+            except BaseException:
+                return False, ("s2->s3" if used_s3 else "s2")
+
+        try:
+            for qi in b_exec_qids:
+                _, sql = tpcds_sqls[qi]
+                ast_q = pickle.loads(pickle.dumps(parse_one(sql)))
+                if not isinstance(ast_q, exp.Expr):
+                    return False, "s3"
+                dk_sql = transpile(sql, write="duckdb")[0]
+                if not _exec_one(qi, ast_q, dk_sql):
+                    return False, "s3"
+            exec_set = set(b_exec_qids)
+            for qi, (_, sql) in enumerate(tpcds_sqls):
+                if qi in exec_set:
+                    continue
+                ast_q = pickle.loads(pickle.dumps(parse_one(sql)))
+                if not isinstance(ast_q, exp.Expr):
+                    return False, "s3"
+            return True, "s3"
+        except BaseException:
+            return False, "s3"
+
     def _maybe_run_dynamic_probes(self, sel: Set[int], sections: List[Dict[str, Any]]) -> Set[int]:
         if not (self.src_root / "sqlglot/__init__.py").is_file():
             return sel
@@ -3658,6 +3803,8 @@ class SelectorEngine:
         want_c = False
         require_a_for_b = False
         b_exec_qids: List[int] = []
+        touches_opt = True
+        touches_exec = True
 
         if (
             self.max_nodes_num is not None
@@ -3680,12 +3827,18 @@ class SelectorEngine:
                 b_exec_qids = list(self.tpcds_exec_qids)
             else:
                 b_exec_qids = [q for q in self.tpcds_exec_qids if (self._tpcds_cov_qmask >> q) & 1]
-            est_b = (
-                (0.0 if want_a else 0.20)
-                + 0.18
-                + 0.205 * len(b_exec_qids)
-                + (0.42 if (b_exec_qids and self._raw_tpcds_tables is None) else 0.0)
-            )
+            touches_opt, touches_exec = self._classify_tpcds_stages(touched_sqlglot)
+            if not touches_opt:
+                est_b = (0.0 if want_a else 0.20) + 0.65
+            elif not touches_exec:
+                est_b = (0.0 if want_a else 0.20) + 0.25 + 0.052 * len(b_exec_qids)
+            else:
+                est_b = (
+                    (0.0 if want_a else 0.20)
+                    + 0.18
+                    + 0.205 * len(b_exec_qids)
+                    + (0.42 if (b_exec_qids and self._raw_tpcds_tables is None) else 0.0)
+                )
             sav_b = (self._packed_cost_ms(sim_cur) - self._packed_cost_ms(sim_cur - {self.tpcds_num})) / 1000.0
             thresh_b = max(3.0, est_b + 1.5)
             est_total_so_far = (0.20 if want_a else 0.0) + est_b
@@ -3709,7 +3862,7 @@ class SelectorEngine:
         try:
             tpcds_sqls = self._get_tpcds_sqls() if want_b else []
             tpcds_schema = self._load_tpcds_schema() if want_b else {}
-            raw_tables = self._ensure_raw_tpcds_tables() if (want_b and b_exec_qids) else {}
+            raw_tables = self._ensure_raw_tpcds_tables() if (want_b and touches_exec and b_exec_qids) else {}
             tpch_sqls = self._get_tpch_sqls() if want_c else []
         except Exception:
             dt = max(0.0, _total_cpu_seconds() - cpu0)
@@ -3777,39 +3930,14 @@ class SelectorEngine:
 
                 if want_b and not (require_a_for_b and res.get("a") is not True):
                     try:
-                        from sqlglot import exp, find_tables, parse_one, transpile
-                        from sqlglot.executor import execute
-                        from sqlglot.executor.table import Table
-
-                        all_tables = (
-                            {tn: Table(columns=cols, rows=rows) for tn, (cols, rows) in raw_tables.items()}
-                            if b_exec_qids
-                            else {}
+                        b_ok, b_stage = self._probe_tpcds(
+                            tpcds_sqls, b_exec_qids, touches_opt, touches_exec, tpcds_schema, raw_tables
                         )
-                        b_ok = True
-                        for qi in b_exec_qids:
-                            _, sql = tpcds_sqls[qi]
-                            ast_q = pickle.loads(pickle.dumps(parse_one(sql)))
-                            dk_sql = transpile(sql, write="duckdb")[0]
-                            tabs = {t.name: all_tables[t.name] for t in find_tables(ast_q)}
-                            tbl = execute(ast_q, schema=tpcds_schema, tables=tabs)
-                            c_cols = [str(c) for c in tbl.columns]
-                            c_rows = [[_canon_cell(x) for x in r] for r in tbl.rows]
-                            if _canon_digest([dk_sql, c_cols, c_rows]) != self.tpcds_digests[qi]:
-                                b_ok = False
-                                break
-                        if b_ok:
-                            exec_set = set(b_exec_qids)
-                            for qi, (_, sql) in enumerate(tpcds_sqls):
-                                if qi in exec_set:
-                                    continue
-                                ast_q = pickle.loads(pickle.dumps(parse_one(sql)))
-                                if not isinstance(ast_q, exp.Expr):
-                                    b_ok = False
-                                    break
                         res["b"] = b_ok
+                        res["b_stage"] = b_stage
                     except BaseException:
                         res["b"] = False
+                        res["b_stage"] = "err"
 
                 if want_c:
                     try:
@@ -3882,12 +4010,13 @@ class SelectorEngine:
             elif self._trace:
                 self._note("probe_keep:max_nodes")
         if want_b and not (require_a_for_b and probe_res.get("a") is not True):
+            b_stage = str(probe_res.get("b_stage") or "s3")
             if probe_res.get("b") is True and self.tpcds_num is not None:
                 out.discard(self.tpcds_num)
                 if self._trace:
-                    self._note(f"probe_drop:tpcds:{len(b_exec_qids)}")
+                    self._note(f"probe_drop:tpcds:{b_stage}:{len(b_exec_qids)}")
             elif self._trace:
-                self._note(f"probe_keep:tpcds:{len(b_exec_qids)}")
+                self._note(f"probe_keep:tpcds:{b_stage}:{len(b_exec_qids)}")
         if want_c:
             if probe_res.get("c") is True and self.tpch_num is not None:
                 out.discard(self.tpch_num)

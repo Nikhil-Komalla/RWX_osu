@@ -2290,6 +2290,8 @@ def run_tpcds_probe_maps(
     from sqlglot import find_tables, parse_one, transpile
     from sqlglot.executor import execute
     from sqlglot.executor.table import Table
+    from sqlglot.optimizer import optimize
+    from sqlglot.schema import ensure_schema
     from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, load_sql_fixture_pairs
 
     mn_tid = "tests/test_parser.py::TestParser::test_max_nodes"
@@ -2349,6 +2351,19 @@ def run_tpcds_probe_maps(
     finally:
         cov.stop()
 
+    schema_obj = ensure_schema(TPCDS_SCHEMA, dialect=None)
+    tpcds_parse_digests: Dict[int, str] = {}
+    tpcds_opt_digests: Dict[int, str] = {}
+    for qi, (meta, sql, _) in enumerate(tpcds_sqls):
+        ast_q = pickle.loads(pickle.dumps(parse_one(sql)))
+        if meta.get("execute"):
+            dk_sql = transpile(sql, write="duckdb")[0]
+            tpcds_parse_digests[int(qi)] = _canon_digest([repr(ast_q), dk_sql])
+            opt_q = optimize(ast_q.copy(), schema_obj, leave_tables_isolated=True, dialect=None)
+            tpcds_opt_digests[int(qi)] = _canon_digest([repr(opt_q), dk_sql])
+        else:
+            tpcds_parse_digests[int(qi)] = _canon_digest(repr(ast_q))
+
     data = cov.get_data()
     exec_set = set(tpcds_exec_qids)
     repo_prefix = str(repo.resolve()) + os.sep
@@ -2384,6 +2399,7 @@ def run_tpcds_probe_maps(
     elapsed = time.perf_counter() - t0
     print(
         f"[Pass 7 tpcds_probe] exec_q={len(tpcds_exec_qids)}/{len(tpcds_sqls)} "
+        f"pdig={len(tpcds_parse_digests)} odig={len(tpcds_opt_digests)} "
         f"tpch={len(tpch_digests)} qcov_files={len(tpcds_query_cov)} "
         f"pcov_files={len(tpcds_parse_cov)} mn_files={len(max_nodes_files)} in {elapsed:.1f}s",
         file=sys.stderr,
@@ -2392,6 +2408,8 @@ def run_tpcds_probe_maps(
     return {
         "tpcds_exec_qids": tuple(tpcds_exec_qids),
         "tpcds_digests": tpcds_digests,
+        "tpcds_parse_digests": tpcds_parse_digests,
+        "tpcds_opt_digests": tpcds_opt_digests,
         "tpcds_query_cov": tpcds_query_cov,
         "tpcds_parse_cov": tpcds_parse_cov,
         "tpch_digests": tpch_digests,
@@ -2405,7 +2423,7 @@ def _main_tpcds_probe_only() -> None:
     os.chdir(repo)
     payload = pickle.loads(zlib.decompress(maps_path.read_bytes()))
     payload.update(run_tpcds_probe_maps(repo, payload["test_ids"], payload["line_cov"]))
-    payload["version"] = max(int(payload.get("version", 5)), 6)
+    payload["version"] = max(int(payload.get("version", 6)), 7)
     raw_bytes = pickle.dumps(payload, protocol=5)
     comp_bytes = zlib.compress(raw_bytes, level=9)
     assert len(comp_bytes) < 2 * 1024 * 1024, f"Map too large: {len(comp_bytes)} bytes"
@@ -2459,7 +2477,7 @@ def _augment_main() -> None:
     print(f"[Pass 6] subprocess_test_ids: {payload['subprocess_test_ids']}", file=sys.stderr, flush=True)
     os.chdir(repo)
     payload.update(run_tpcds_probe_maps(repo, payload["test_ids"], payload["line_cov"]))
-    payload["version"] = max(int(payload.get("version", 5)), 6)
+    payload["version"] = max(int(payload.get("version", 6)), 7)
     raw_bytes = pickle.dumps(payload, protocol=5)
     comp_bytes = zlib.compress(raw_bytes, level=9)
     maps_path.write_bytes(comp_bytes)
@@ -2580,7 +2598,7 @@ def main() -> None:
     payload["eq_safe_sites"] = _site_dict_to_frozensets(eq_res.get("safe_sites", {}))
     payload["eq_sites_stats"] = eq_res.get("stats", {})
     payload.update(run_tpcds_probe_maps(repo, test_ids, line_cov))
-    payload["version"] = 6
+    payload["version"] = 7
     raw_bytes = pickle.dumps(payload, protocol=5)
     comp_bytes = zlib.compress(raw_bytes, level=9)
     out_path.write_bytes(comp_bytes)

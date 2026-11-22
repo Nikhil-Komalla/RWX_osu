@@ -1594,6 +1594,108 @@ class SelectorUnitTests(unittest.TestCase):
         self.assertIn(eng.tpcds_num, sel_dis)
         self.assertEqual(eng.last_probe_cpu_s, 0.0)
         self.assertFalse(any(r.startswith("probe_") for r in eng.reasons), eng.reasons)
+        selector.DISABLED.discard("dynamic_probe")
+
+    def test_v9_tpcds_three_stage_shortcircuit(self) -> None:
+        import difflib
+
+        eng = self._make_real_engine()
+        base = RWX_DIR / "_sqlglot_baseline"
+        tpcds_num = eng.tpcds_num
+        self.assertIsNotNone(tpcds_num)
+        self.assertEqual(len(eng.tpcds_parse_digests), 99)
+        self.assertEqual(len(eng.tpcds_opt_digests), 57)
+
+        # 1) Stage classification invariants
+        self.assertEqual(eng._classify_tpcds_stages({"sqlglot/parsers/snowflake.py"}), (False, False))
+        self.assertEqual(eng._classify_tpcds_stages({"sqlglot/generators/mysql.py"}), (False, False))
+        self.assertEqual(eng._classify_tpcds_stages({"sqlglot/serde.py"}), (False, False))
+        self.assertEqual(eng._classify_tpcds_stages({"sqlglot/optimizer/simplify.py"}), (True, False))
+        self.assertEqual(eng._classify_tpcds_stages({"sqlglot/typing/snowflake.py"}), (True, False))
+        self.assertEqual(eng._classify_tpcds_stages({"sqlglot/transforms.py"}), (True, False))
+        self.assertEqual(eng._classify_tpcds_stages({"sqlglot/executor/context.py"}), (True, True))
+        self.assertEqual(eng._classify_tpcds_stages({"sqlglot/expressions/builders.py"}), (True, True))
+        self.assertEqual(eng._classify_tpcds_stages({"sqlglot/planner.py"}), (True, True))
+        self.assertEqual(eng._classify_tpcds_stages({"sqlglot/generators/python.py"}), (True, True))
+        self.assertEqual(eng._classify_tpcds_stages({"sqlglot/schema.py"}), (True, True))
+        self.assertEqual(eng._classify_tpcds_stages({"sqlglot/trie.py"}), (True, True))
+        self.assertEqual(eng._classify_tpcds_stages({"sqlglot/time.py"}), (True, True))
+
+        def _make_patch(rel: str, old_s: str, new_s: str) -> str:
+            return (
+                f"diff --git a/{rel} b/{rel}\nindex 0000000..1111111 100644\n"
+                + "".join(difflib.unified_diff(old_s.splitlines(True), new_s.splitlines(True), f"a/{rel}", f"b/{rel}", n=3))
+            )
+
+        selector.TRACE = True
+
+        # 2) Stage 1 short-circuit + s1->s2 + s1->s3 fallthrough (sqlglot/serde.py constant -> sav_b ~14.9s)
+        serde_rel = "sqlglot/serde.py"
+        ssrc = (base / serde_rel).read_text("utf-8")
+        lines = ssrc.splitlines(True)
+        ins_idx = next(i for i, l in enumerate(lines) if l.startswith(("def ", "class ", "TYPE_ANNOTATION")))
+        snew = "".join(lines[:ins_idx] + ["_ZZ_V9_MOD_CONST = 123\n"] + lines[ins_idx:])
+        patch_s1 = _make_patch(serde_rel, ssrc, snew)
+
+        sel_s1 = eng.select_commit(patch_s1)
+        self.assertNotIn(tpcds_num, sel_s1)
+        self.assertTrue(any(r.startswith("probe_drop:tpcds:s1:") for r in eng.reasons), eng.reasons)
+        self.assertLess(eng.last_probe_cpu_s, 3.0)
+        self.assertIsNone(eng._raw_tpcds_tables)
+
+        orig_p0 = eng.tpcds_parse_digests[0]
+        orig_o0 = eng.tpcds_opt_digests[0]
+        try:
+            eng.tpcds_parse_digests[0] = "mismatch"
+            sel_s12 = eng.select_commit(patch_s1)
+            self.assertNotIn(tpcds_num, sel_s12)
+            self.assertTrue(any(r.startswith("probe_drop:tpcds:s1->s2:") for r in eng.reasons), eng.reasons)
+            self.assertIsNone(eng._raw_tpcds_tables)
+
+            eng.tpcds_opt_digests[0] = "mismatch"
+            sel_s13 = eng.select_commit(patch_s1)
+            self.assertNotIn(tpcds_num, sel_s13)
+            self.assertTrue(any(r.startswith("probe_drop:tpcds:s1->s3:") for r in eng.reasons), eng.reasons)
+        finally:
+            eng.tpcds_parse_digests[0] = orig_p0
+            eng.tpcds_opt_digests[0] = orig_o0
+
+        # Sample 3utz (serde.py) -> Stage 1 catches KeyError & keeps #1106
+        p_3utz = (RWX_DIR / "sample/commits/3utz.patch").read_text("utf-8")
+        sel_3utz = eng.select_commit(p_3utz)
+        self.assertIn(tpcds_num, sel_3utz)
+        self.assertTrue(any(r.startswith("probe_keep:tpcds:s1:") for r in eng.reasons), eng.reasons)
+
+        # 3) Stage 2 short-circuit + s2->s3 fallthrough (simplify.py -> sav_b > thresh_b)
+        simp_rel = "sqlglot/optimizer/simplify.py"
+        simp_src = (base / simp_rel).read_text("utf-8")
+        simp_target = "    return Simplifier(dialect=dialect).simplify("
+        self.assertIn(simp_target, simp_src)
+        simp_new = simp_src.replace(simp_target, "    if False:\n        _zz_v9_s2 = 1\n" + simp_target, 1)
+        patch_s2 = _make_patch(simp_rel, simp_src, simp_new)
+
+        eng._raw_tpcds_tables = None
+        sel_s2 = eng.select_commit(patch_s2)
+        self.assertNotIn(tpcds_num, sel_s2)
+        self.assertTrue(any(r.startswith("probe_drop:tpcds:s2:") for r in eng.reasons), eng.reasons)
+        self.assertLess(eng.last_probe_cpu_s, 6.0)
+        self.assertIsNone(eng._raw_tpcds_tables)
+
+        q_hit = next(q for q in eng.tpcds_exec_qids if (eng._tpcds_cov_qmask >> q) & 1) if eng._tpcds_cov_qmask else 0
+        orig_oq = eng.tpcds_opt_digests[q_hit]
+        try:
+            eng.tpcds_opt_digests[q_hit] = "mismatch"
+            sel_s23 = eng.select_commit(patch_s2)
+            self.assertNotIn(tpcds_num, sel_s23)
+            self.assertTrue(any(r.startswith("probe_drop:tpcds:s2->s3:") for r in eng.reasons), eng.reasons)
+        finally:
+            eng.tpcds_opt_digests[q_hit] = orig_oq
+
+        # Sample 2jrq (eliminate_joins.py) -> Stage 2 detects opt diff, falls through to Stage 3 at q1 & keeps #1106
+        p_2jrq = (RWX_DIR / "sample/commits/2jrq.patch").read_text("utf-8")
+        sel_2jrq = eng.select_commit(p_2jrq)
+        self.assertIn(tpcds_num, sel_2jrq)
+        self.assertTrue(any(r.startswith("probe_keep:tpcds:s2->s3:") for r in eng.reasons), eng.reasons)
 
 
 if __name__ == "__main__":
