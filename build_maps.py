@@ -2386,6 +2386,19 @@ def run_tpcds_probe_maps(
     finally:
         cov.stop()
 
+    tpcds_opt_asts_zlib = zlib.compress(
+        pickle.dumps({int(qi): s2_opts[qi] for qi in tpcds_exec_qids}, protocol=5),
+        level=9,
+    )
+    roundtrip_opts = pickle.loads(zlib.decompress(tpcds_opt_asts_zlib))
+    for qi in tpcds_exec_qids:
+        tabs = {t.name: tpcds_tables[t.name] for t in find_tables(s1_asts[qi])}
+        tables_ = ensure_tables(tabs, dialect=None)
+        tbl = PythonExecutor(tables=tables_).execute(Plan(roundtrip_opts[qi]))
+        c_cols = [str(c) for c in tbl.columns]
+        c_rows = [[_canon_cell(x) for x in r] for r in tbl.rows]
+        assert _canon_digest([s1_dks[qi], c_cols, c_rows]) == tpcds_digests[int(qi)], f"roundtrip mismatch q{qi}"
+
     tpcds_parse_digests: Dict[int, str] = {}
     tpcds_opt_digests: Dict[int, str] = {}
     for qi, _ in enumerate(tpcds_sqls):
@@ -2397,10 +2410,102 @@ def run_tpcds_probe_maps(
         else:
             tpcds_parse_digests[int(qi)] = _canon_digest(repr(ast_q))
 
+    # Trace TestOptimizer.test_tpcds (all 99 TPC-DS queries: parse o1 vs optimize+walk+sql(pretty=True) o2).
+    import sqlglot as _sqlglot_mod
+    from sqlglot import exp as _exp_mod, optimizer as _opt_pkg
+    from sqlglot.schema import MappingSchema as _MappingSchema
+    from tests.helpers import string_to_bool as _str_to_bool
+
+    opt_tpcds_parse_digests: Dict[int, str] = {}
+    o1_asts: Dict[int, Any] = {}
+    prev_schema = getattr(_sqlglot_mod, "schema", None)
+    _sqlglot_mod.schema = _MappingSchema()
+    cov_opt = coverage.Coverage(data_file=None, source=[str(repo / "sqlglot")], branch=False)
+    cov_opt.start()
+    try:
+        cov_opt.switch_context("o1:init")
+        _ = parse_one("SELECT 1")
+        for qi, (meta, sql, _) in enumerate(tpcds_sqls):
+            cov_opt.switch_context(f"o1:{qi}")
+            dialect = meta.get("dialect")
+            ast_o = parse_one(sql, read=dialect)
+            o1_asts[qi] = ast_o
+            opt_tpcds_parse_digests[int(qi)] = _canon_digest(repr(ast_o))
+
+        cov_opt.switch_context("o2:init")
+        w_opt = _opt_pkg.optimize(parse_one("SELECT 1"), schema={"t": {"a": "INT"}})
+        _ = w_opt.sql(pretty=True)
+        for qi, (meta, sql, expected) in enumerate(tpcds_sqls):
+            cov_opt.switch_context(f"o2:{qi}")
+            dialect = meta.get("dialect")
+            func_kwargs: Dict[str, Any] = {"schema": json.loads(meta["schema"]) if meta.get("schema") else TPCDS_SCHEMA}
+            if meta.get("leave_tables_isolated") is not None:
+                func_kwargs["leave_tables_isolated"] = _str_to_bool(meta["leave_tables_isolated"])
+            if meta.get("validate_qualify_columns") is not None:
+                func_kwargs["validate_qualify_columns"] = _str_to_bool(meta["validate_qualify_columns"])
+            if meta.get("canonicalize_table_aliases") is not None:
+                func_kwargs["canonicalize_table_aliases"] = _str_to_bool(meta["canonicalize_table_aliases"])
+            if dialect:
+                func_kwargs["dialect"] = dialect
+            optimized = _opt_pkg.optimize(o1_asts[qi].copy(), **func_kwargs)
+            for expression in optimized.walk():
+                for arg_key, arg in expression.args.items():
+                    for child in arg if isinstance(arg, list) else [arg]:
+                        if isinstance(child, _exp_mod.Expr):
+                            assert child.arg_key == arg_key
+                            assert child.parent is expression
+            actual = optimized.sql(pretty=True, dialect=dialect)
+            assert actual == expected, f"opt_tpcds baseline mismatch q{qi}"
+    finally:
+        cov_opt.stop()
+        _sqlglot_mod.schema = prev_schema
+
+    opt_data = cov_opt.get_data()
+    all_opt_mask = (1 << len(tpcds_sqls)) - 1
+    repo_prefix = str(repo.resolve()) + os.sep
+    opt_tpcds_qcov: Dict[str, Dict[int, int]] = {}
+    opt_tpcds_s2_lines: Dict[str, List[int]] = {}
+    for fname in sorted(opt_data.measured_files()):
+        try:
+            rfname = str(pathlib.Path(fname).resolve())
+        except OSError:
+            rfname = fname
+        if not rfname.startswith(repo_prefix):
+            continue
+        rel = rfname[len(repo_prefix) :].replace(os.sep, "/")
+        if not rel.startswith("sqlglot/"):
+            continue
+        oqmap: Dict[int, int] = {}
+        os2set: Set[int] = set()
+        for ln, ctxs in opt_data.contexts_by_lineno(fname).items():
+            omask = 0
+            in_o2 = False
+            for c in ctxs:
+                if not c:
+                    continue
+                if c == "o1:init":
+                    omask |= all_opt_mask
+                elif c == "o2:init":
+                    omask |= all_opt_mask
+                    in_o2 = True
+                elif c.startswith("o1:"):
+                    omask |= 1 << int(c[3:])
+                elif c.startswith("o2:"):
+                    omask |= 1 << int(c[3:])
+                    in_o2 = True
+            li = int(ln)
+            if omask:
+                oqmap[li] = omask
+            if in_o2:
+                os2set.add(li)
+        if oqmap:
+            opt_tpcds_qcov[rel] = dict(sorted(oqmap.items()))
+        if os2set:
+            opt_tpcds_s2_lines[rel] = sorted(os2set)
+
     data = cov.get_data()
     exec_set = set(tpcds_exec_qids)
     all_exec_mask = sum(1 << q for q in tpcds_exec_qids)
-    repo_prefix = str(repo.resolve()) + os.sep
     tpcds_query_cov: Dict[str, Dict[int, int]] = {}
     tpcds_parse_cov: Dict[str, List[int]] = {}
     tpcds_s2_lines: Dict[str, List[int]] = {}
@@ -2473,11 +2578,16 @@ def run_tpcds_probe_maps(
             tpcds_s3_query_cov[rel] = dict(sorted(s3qmap.items()))
 
     tpch_digests = tuple(_canon_digest(pickle.loads(pickle.dumps(parse_one(sql))).sql()) for _, sql, _ in tpch_sqls)
+    opt_tpch_digests = tuple(
+        _canon_digest([transpile(sql, write="duckdb")[0], transpile(opt_sql, write="duckdb")[0]])
+        for _, sql, opt_sql in tpch_sqls
+    )
     elapsed = time.perf_counter() - t0
     print(
         f"[Pass 7 tpcds_probe] exec_q={len(tpcds_exec_qids)}/{len(tpcds_sqls)} "
-        f"pdig={len(tpcds_parse_digests)} odig={len(tpcds_opt_digests)} "
-        f"tpch={len(tpch_digests)} qcov_files={len(tpcds_query_cov)} "
+        f"pdig={len(tpcds_parse_digests)} odig={len(tpcds_opt_digests)} opt_asts={len(tpcds_opt_asts_zlib)//1024}KiB "
+        f"tpch={len(tpch_digests)} opt_tpch={len(opt_tpch_digests)} "
+        f"qcov_files={len(tpcds_query_cov)} opt_tpcds_files={len(opt_tpcds_qcov)} "
         f"s2_files={len(tpcds_s2_lines)} s3_files={len(tpcds_s3_lines)} "
         f"pcov_files={len(tpcds_parse_cov)} mn_files={len(max_nodes_files)} in {elapsed:.1f}s",
         file=sys.stderr,
@@ -2488,11 +2598,16 @@ def run_tpcds_probe_maps(
         "tpcds_digests": tpcds_digests,
         "tpcds_parse_digests": tpcds_parse_digests,
         "tpcds_opt_digests": tpcds_opt_digests,
+        "tpcds_opt_asts_zlib": tpcds_opt_asts_zlib,
         "tpcds_query_cov": tpcds_query_cov,
         "tpcds_parse_cov": tpcds_parse_cov,
         "tpcds_s2_lines": tpcds_s2_lines,
         "tpcds_s3_lines": tpcds_s3_lines,
         "tpcds_s3_query_cov": tpcds_s3_query_cov,
+        "opt_tpcds_parse_digests": opt_tpcds_parse_digests,
+        "opt_tpcds_qcov": opt_tpcds_qcov,
+        "opt_tpcds_s2_lines": opt_tpcds_s2_lines,
+        "opt_tpch_digests": opt_tpch_digests,
         "tpch_digests": tpch_digests,
         "max_nodes_files": max_nodes_files,
     }
@@ -2507,7 +2622,7 @@ def _main_tpcds_probe_only() -> None:
     payload.update(run_tpcds_probe_maps(repo, payload["test_ids"], payload["line_cov"]))
     if old_digests:
         assert old_digests == payload["tpcds_digests"], "tpcds_digests mismatch against previous map!"
-    payload["version"] = max(int(payload.get("version", 7)), 8)
+    payload["version"] = max(int(payload.get("version", 9)), 10)
     raw_bytes = pickle.dumps(payload, protocol=5)
     comp_bytes = zlib.compress(raw_bytes, level=9)
     assert len(comp_bytes) < 2 * 1024 * 1024, f"Map too large: {len(comp_bytes)} bytes"
@@ -2520,8 +2635,18 @@ def _main_tpcds_probe_only() -> None:
 
 
 _FAST_PROBE_DISCOVERY_SCRIPT = r"""
-import concurrent.futures, hashlib, importlib, io, json, subprocess, sys, tempfile, types, unittest
+import concurrent.futures, hashlib, importlib, io, json, os, subprocess, sys, tempfile, types, unittest
 from collections import defaultdict
+
+_WRITE_COUNT = 0
+def _audit_open(ev, args):
+    global _WRITE_COUNT
+    if ev == "open" and len(args) >= 2 and isinstance(args[1], str):
+        if any(c in args[1] for c in ("w", "a", "+", "x")):
+            p = args[0]
+            if p != os.devnull and not isinstance(p, int):
+                _WRITE_COUNT += 1
+sys.addaudithook(_audit_open)
 
 payload_in = json.loads(sys.stdin.read())
 repo = payload_in["repo"]
@@ -2530,6 +2655,10 @@ special = {
     "tests/test_parser.py::TestParser::test_max_nodes",
     "tests/test_executor.py::TestExecutor::test_execute_tpcds",
     "tests/test_executor.py::TestExecutor::test_execute_tpch",
+    "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+    "tests/test_optimizer.py::TestOptimizer::test_tpcds",
+    "tests/test_optimizer.py::TestOptimizer::test_scope",
+    "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs",
     "tests/test_generator.py::TestGenerator::test_generator_memory",
 } | set(payload_in.get("subprocess_test_ids", ()))
 
@@ -2557,13 +2686,19 @@ class _MissingStubObj:
         raise _MissingDepError(f"missing dep getitem: {self._name}")
 
 for root_mod in ("duckdb", "numpy", "pandas", "pandas.testing", "pytz", "dateutil", "dateutil.relativedelta"):
+    try:
+        importlib.import_module(root_mod)
+        continue
+    except ImportError:
+        pass
     for existing in [k for k in list(sys.modules) if k == root_mod or k.startswith(root_mod + ".")]:
         del sys.modules[existing]
     m = types.ModuleType(root_mod)
     m.__path__ = []
     m.__getattr__ = lambda attr, _r=root_mod: (_ for _ in ()).throw(AttributeError(attr)) if (attr.startswith("__") and attr.endswith("__")) else _MissingStubObj(f"{_r}.{attr}")
     sys.modules[root_mod] = m
-sys.modules["dateutil"].relativedelta = sys.modules["dateutil.relativedelta"]
+if "dateutil.relativedelta" in sys.modules:
+    sys.modules["dateutil"].relativedelta = sys.modules["dateutil.relativedelta"]
 
 for tf_attr in ("TemporaryDirectory", "NamedTemporaryFile", "TemporaryFile", "SpooledTemporaryFile", "mkstemp", "mkdtemp"):
     if hasattr(tempfile, tf_attr):
@@ -2602,6 +2737,17 @@ class _ConnRecorder:
         if kw or not isinstance(a, _DFToken) or not isinstance(b, _DFToken):
             raise _MissingDepError("assert_frame_equal args")
         self.digests.append(hashlib.sha256((a.sql_s + "\0" + b.sql_s).encode("utf-8")).hexdigest()[:16])
+
+def _make_opt_duckdb_conn(mod_obj):
+    dk = sys.modules.get("duckdb")
+    if dk is None or not hasattr(dk, "__file__"):
+        return None
+    src = open(os.path.join(repo, "tests", "test_optimizer.py"), encoding="utf-8").read()
+    i0 = src.index("CREATE TABLE x (a INT, b INT);")
+    i1 = src.index("CROSS JOIN (VALUES (TRUE), (FALSE), (NULL)) AS z(c);") + len("CROSS JOIN (VALUES (TRUE), (FALSE), (NULL)) AS z(c);")
+    conn = dk.connect(":memory:")
+    conn.execute(src[i0:i1])
+    return conn
 
 class _StrictTestResult(unittest.TestResult):
     def __init__(self):
@@ -2642,6 +2788,7 @@ opt_conn_digests = {}
 orig_out, orig_err = sys.stdout, sys.stderr
 sys.stdout = io.StringIO()
 sys.stderr = io.StringIO()
+opt_real_conn = None
 try:
     for (tfile, cls_name), items in sorted(by_cls.items()):
         try:
@@ -2679,6 +2826,7 @@ try:
         try:
             for tid, meth_name in items:
                 try:
+                    w0 = _WRITE_COUNT
                     tc = cls(meth_name)
                     if getattr(tc, "__unittest_skip__", False) or getattr(getattr(cls, meth_name, None), "__unittest_skip__", False):
                         fast_unprobed.append(tid)
@@ -2697,14 +2845,39 @@ try:
                         and not res.errors
                         and not res.skipped
                         and res.wasSuccessful()
+                        and _WRITE_COUNT == w0
                     )
                     if ok and rec is not None:
                         ok = len(rec.calls) == 2 * len(rec.digests)
                     if ok:
                         if rec is not None and rec.digests:
                             opt_conn_digests[tid] = rec.digests
-                    else:
-                        fast_unprobed.append(tid)
+                        continue
+                    if is_opt and orig_afe is not None and not isinstance(orig_afe, _MissingStubObj):
+                        try:
+                            if opt_real_conn is None:
+                                opt_real_conn = _make_opt_duckdb_conn(mod)
+                            if opt_real_conn is not None:
+                                w1 = _WRITE_COUNT
+                                cls.conn = opt_real_conn
+                                mod.assert_frame_equal = orig_afe
+                                tc2 = cls(meth_name)
+                                res2 = _StrictTestResult()
+                                tc2.run(res2)
+                                ok2 = (
+                                    res2.testsRun == 1
+                                    and not res2.any_bad
+                                    and not res2.failures
+                                    and not res2.errors
+                                    and not res2.skipped
+                                    and res2.wasSuccessful()
+                                    and _WRITE_COUNT == w1
+                                )
+                                if ok2:
+                                    continue
+                        except BaseException:
+                            pass
+                    fast_unprobed.append(tid)
                 except BaseException:
                     fast_unprobed.append(tid)
         finally:
@@ -2742,7 +2915,8 @@ def run_fast_probe_maps(
     subprocess_test_ids: Sequence[str],
 ) -> Dict[str, Any]:
     t0 = time.perf_counter()
-    py_exec = "/usr/bin/python3" if pathlib.Path("/usr/bin/python3").exists() else sys.executable
+    venv_py = pathlib.Path("/home/nikhi/rwx-venv/bin/python")
+    py_exec = str(venv_py) if venv_py.exists() else sys.executable
     sub_env = {"HOME": "/tmp", "PATH": "/usr/bin:/bin", "SKIP_INTEGRATION": "0"}
     proc = subprocess.run(
         [py_exec, "-B", "-c", _FAST_PROBE_DISCOVERY_SCRIPT],
@@ -2780,7 +2954,7 @@ def _main_fast_probe_only() -> None:
     os.chdir(repo)
     payload = pickle.loads(zlib.decompress(maps_path.read_bytes()))
     payload.update(run_fast_probe_maps(repo, payload["test_ids"], payload.get("subprocess_test_ids", ())))
-    payload["version"] = max(int(payload.get("version", 8)), 9)
+    payload["version"] = max(int(payload.get("version", 9)), 10)
     raw_bytes = pickle.dumps(payload, protocol=5)
     comp_bytes = zlib.compress(raw_bytes, level=9)
     assert len(comp_bytes) < 2 * 1024 * 1024, f"Map too large: {len(comp_bytes)} bytes"
@@ -2835,7 +3009,7 @@ def _augment_main() -> None:
     os.chdir(repo)
     payload.update(run_tpcds_probe_maps(repo, payload["test_ids"], payload["line_cov"]))
     payload.update(run_fast_probe_maps(repo, payload["test_ids"], payload.get("subprocess_test_ids", ())))
-    payload["version"] = max(int(payload.get("version", 8)), 9)
+    payload["version"] = max(int(payload.get("version", 9)), 10)
     raw_bytes = pickle.dumps(payload, protocol=5)
     comp_bytes = zlib.compress(raw_bytes, level=9)
     maps_path.write_bytes(comp_bytes)
@@ -2957,7 +3131,7 @@ def main() -> None:
     payload["eq_sites_stats"] = eq_res.get("stats", {})
     payload.update(run_tpcds_probe_maps(repo, test_ids, line_cov))
     payload.update(run_fast_probe_maps(repo, test_ids, payload.get("subprocess_test_ids", ())))
-    payload["version"] = 9
+    payload["version"] = 10
     raw_bytes = pickle.dumps(payload, protocol=5)
     comp_bytes = zlib.compress(raw_bytes, level=9)
     out_path.write_bytes(comp_bytes)

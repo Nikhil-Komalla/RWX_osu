@@ -1855,7 +1855,7 @@ class SelectorUnitTests(unittest.TestCase):
         }
         fake_eng = selector.SelectorEngine(fake_tests_json, fake_maps, base)
         unit_src = (
-            b"import unittest, pytz\n"
+            b"import unittest, tempfile\n"
             b"class TestZZ(unittest.TestCase):\n"
             b"    setup_calls = 0\n"
             b"    @classmethod\n"
@@ -1870,7 +1870,7 @@ class SelectorUnitTests(unittest.TestCase):
             b"    def test_skip(self):\n"
             b"        self.skipTest('skip must keep')\n"
             b"    def test_missing_dep(self):\n"
-            b"        pytz.timezone('UTC')\n"
+            b"        tempfile.NamedTemporaryFile()\n"
         )
         broken_src = b"raise ImportError('broken test module')\n"
         import os as _os
@@ -1927,21 +1927,99 @@ class SelectorUnitTests(unittest.TestCase):
             "        if not table_alias:\n            if False:\n                _zz_cap = 1\n            return []\n",
             1,
         )
-        eng2 = self._make_real_engine()
-        self.assertEqual(eng2.max_s3_exec_qids, 20)
-        sel_cap = eng2.select_commit(_make_patch(c_rel, c_src, c_new))
-        self.assertIn(eng2.tpcds_num, sel_cap)
-        self.assertEqual(eng2.last_probe_cpu_s, 0.0)
-        self.assertFalse(any(r.startswith("probe_drop:tpcds:") for r in eng2.reasons), eng2.reasons)
+        with mock.patch.dict(os.environ, {"BLAST_MAX_S3_QIDS": "20"}):
+            eng2 = self._make_real_engine()
+            self.assertEqual(eng2.max_s3_exec_qids, 20)
+            sel_cap = eng2.select_commit(_make_patch(c_rel, c_src, c_new))
+            self.assertIn(eng2.tpcds_num, sel_cap)
+            self.assertEqual(eng2.last_probe_cpu_s, 0.0)
+            self.assertFalse(any(r.startswith("probe_drop:tpcds:") for r in eng2.reasons), eng2.reasons)
 
-        # Exhaust P2 (15s) while P1 remains available -> P1 fast probes still run & drop!
-        eng2.s3_probe_cpu_s = 15.0
+        # Exhaust P2 while P1 remains available -> P1 fast probes still run & drop!
+        eng2.s3_probe_cpu_s = eng2.probe_cpu_budget_s
         eng2.fast_probe_cpu_s = 0.0
         eng2.total_probe_cpu_s = 15.0
         p_2qn5 = (RWX_DIR / "sample/commits/2qn5.patch").read_text("utf-8")
         sel_p1 = eng2.select_commit(p_2qn5)
         self.assertEqual(sel_p1, set(), eng2.reasons)
         self.assertTrue(any(r.startswith("probe_drop:fast:") for r in eng2.reasons), eng2.reasons)
+
+    def test_v12_full_oracle_slow_probes_and_batch_roi(self) -> None:
+        import difflib
+
+        eng = self._make_real_engine()
+        base = RWX_DIR / "_sqlglot_baseline"
+        selector.TRACE = True
+
+        # 1) Verify v12 map schema and expanded default cap
+        maps = selector.load_maps(RWX_DIR / "maps/blast_maps.pkl.zlib")
+        self.assertGreaterEqual(int(maps.get("version", 0)), 10)
+        self.assertLessEqual(len(maps.get("fast_unprobed_ids", ())), 10)
+        self.assertEqual(eng.max_s3_exec_qids, 57)
+        self.assertTrue(bool(eng.tpcds_opt_asts_zlib))
+        self.assertEqual(len(eng.opt_tpch_digests), 22)
+        self.assertEqual(len(eng.opt_tpcds_parse_digests), 99)
+
+        def _make_patch(rel: str, old_s: str, new_s: str) -> str:
+            return (
+                f"diff --git a/{rel} b/{rel}\nindex 0000000..1111111 100644\n"
+                + "".join(difflib.unified_diff(old_s.splitlines(True), new_s.splitlines(True), f"a/{rel}", f"b/{rel}", n=3))
+            )
+
+        # 2) Direct Plan(opt_q)+PythonExecutor drops benign Stage-3 executor edit and keeps broken one!
+        env_rel = "sqlglot/executor/env.py"
+        env_src = (base / env_rel).read_text("utf-8")
+        env_ok = env_src.replace(
+            "def sql_not(value):\n",
+            "def sql_not(value):\n    if False:\n        _zz_v12 = 1\n",
+            1,
+        )
+        eng._raw_tpcds_tables = None
+        sel_env_ok = eng.select_commit(_make_patch(env_rel, env_src, env_ok))
+        self.assertNotIn(eng.tpcds_num, sel_env_ok, eng.reasons)
+        self.assertTrue(any(r.startswith("probe_drop:tpcds:s3") for r in eng.reasons), eng.reasons)
+
+        env_bad = env_src.replace(
+            "    return None if value is None else not bool(value)\n",
+            "    return None if value is None else bool(value)\n",
+            1,
+        )
+        sel_env_bad = eng.select_commit(_make_patch(env_rel, env_src, env_bad))
+        self.assertIn(eng.tpcds_num, sel_env_bad, eng.reasons)
+        self.assertTrue(any(r.startswith("probe_keep:tpcds:s3") for r in eng.reasons), eng.reasons)
+
+        # 3) #1295 test_annotate_funcs: drops benign leaf edit and fails fast on sample commit j6uz
+        p_j6uz = (RWX_DIR / "sample/commits/j6uz.patch").read_text("utf-8")
+        sel_j6uz = eng.select_commit(p_j6uz)
+        self.assertIn(eng.ann_funcs_num, sel_j6uz, eng.reasons)
+        self.assertLess(eng.last_probe_cpu_s, 0.35)
+
+        bq_rel = "sqlglot/parsers/bigquery.py"
+        bq_src = (base / bq_rel).read_text("utf-8")
+        bq_new = bq_src.replace(
+            "        for arg_key in MAKE_INTERVAL_KWARGS:\n",
+            "        if False:\n            _zz_v12_bq = 1\n        for arg_key in MAKE_INTERVAL_KWARGS:\n",
+            1,
+        )
+        bq_patch = _make_patch(bq_rel, bq_src, bq_new)
+        static_bq, _, _ = eng._select_static_commit(bq_patch)
+        self.assertIn(eng.ann_funcs_num, static_bq)
+        sel_bq = eng.select_commit(bq_patch)
+        self.assertEqual(sel_bq, set(), eng.reasons)
+        self.assertIn("probe_drop:ann_funcs:leaf", eng.reasons)
+        if eng.opt_tpch_num is not None:
+            self.assertNotIn(eng.opt_tpch_num, sel_bq, eng.reasons)
+
+        # 4) Global ROI Priority Queue in select_batch: under tight budget (3.0s), Tier-1 high-ROI commit
+        #    (2qn5) runs BEFORE Stage-3 heavy commit (3utz) even though 3utz appears first in input order!
+        eng_roi = self._make_real_engine()
+        eng_roi.probe_cpu_budget_s = 3.0
+        p_3utz = (RWX_DIR / "sample/commits/3utz.patch").read_text("utf-8")
+        p_2qn5 = (RWX_DIR / "sample/commits/2qn5.patch").read_text("utf-8")
+        res = eng_roi.select_batch([p_3utz, p_2qn5], scale_budget=False)
+        self.assertEqual(len(res), 2)
+        self.assertIn(eng_roi.tpcds_num, res[0][0])
+        self.assertEqual(res[1][0], set(), res[1][1])
 
 
 if __name__ == "__main__":
