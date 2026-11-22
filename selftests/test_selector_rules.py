@@ -255,6 +255,48 @@ class SelectorUnitTests(unittest.TestCase):
         eng.lazy_test_importers = {"sqlglot/mod_a.py": ["tests/test_beta.py"]}
         self.assertEqual(eng.select_commit(p), {0, 1, 2})
 
+        # Also when raw_once_lines marks a line that is runtime-covered inside an ordinary method (e.g. import-time helper).
+        p_compute = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -4,4 +4,4 @@ class Widget:\n"
+            "     def compute(self, x):\n"
+            "         if x > 0:\n"
+            "-            return x + 1\n"
+            "+            return x + 2\n"
+            "         return 0\n"
+        )
+        eng.raw_once_lines["sqlglot/mod_a.py"] = [6]
+        eng._once_cache.clear()
+        self.assertEqual(eng.select_commit(p_compute), {0, 1, 2})
+
+    def test_collection_lines_join_line_coverage(self) -> None:
+        """Lines executed during test file collection/import are attributed to all tests in that test file."""
+        eng = _make_mini_engine()
+        sample_mod_a = "\n".join([
+            "class Widget:",
+            "    def compute(self, x):",
+            "        if x > 0:",
+            "            return x + 1",
+            "        return x + 2",
+        ]) + "\n"
+        eng._ast_cache["sqlglot/mod_a.py"] = (sample_mod_a, ast.parse(sample_mod_a))
+        eng.collection_lines = {"sqlglot/mod_a.py": {5: ["tests/test_beta.py"]}}
+        eng._line_cache.clear()
+        p = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -3,3 +3,3 @@ class Widget:\n"
+            "         if x > 0:\n"
+            "             return x + 1\n"
+            "-        return x + 2\n"
+            "+        return x + 3\n"
+        )
+        self.assertIn(2, eng.select_commit(p))
+        self.assertEqual(eng._lines_cov("sqlglot/mod_a.py", [5]) & (1 << 2), 1 << 2)
+
     def test_out_of_tree_path_mentions(self) -> None:
         eng = _make_mini_engine()
         eng.path_mentions = {"sqlglotc": ["tests/test_beta.py"]}
@@ -267,16 +309,6 @@ class SelectorUnitTests(unittest.TestCase):
             "+a = 2\n"
         )
         self.assertIn(2, eng.select_commit(p))
-
-    def test_union_v1_rule(self) -> None:
-        eng = _make_mini_engine()
-        class MockV1:
-            def select_commit(self, patch_text: str):
-                return {2, 3}
-        self.assertEqual(selector.combine_selections({0}, {2, 3}, v3_engine=eng), {0, 2, 3})
-        self.assertEqual(selector.select_commit_v4(eng, MockV1(), ""), {2, 3})
-        selector.DISABLED.add("union_v1")
-        self.assertEqual(selector.combine_selections({0}, {2, 3}, v3_engine=eng), {0})
 
     def test_empty_guard_rule(self) -> None:
         eng = _make_mini_engine()
@@ -294,14 +326,10 @@ class SelectorUnitTests(unittest.TestCase):
             "+    KEYWORDS = {'a': 2}\n"
         )
         selector.DISABLED.discard("empty_guard")
-        # Standalone select_commit sees 0 tracked readers -> empty_guard adds Widget class_usage {1, 2}.
+        # Pending entry is recorded when apply_empty_guard=False; select_commit(apply_empty_guard=True) applies it.
+        self.assertEqual(eng.select_commit(p, apply_empty_guard=False), set())
+        self.assertIn("sqlglot/mod_a.py", eng._empty_guard_pending)
         self.assertEqual(eng.select_commit(p), {1, 2})
-        # When union_v1 already got {0}, empty_guard does NOT inflate.
-        v3_sel = eng.select_commit(p, apply_empty_guard=False)
-        self.assertEqual(v3_sel, set())
-        self.assertEqual(selector.combine_selections(v3_sel, {0}, v3_engine=eng), {0})
-        # When BOTH v3 and v1 got empty, empty_guard fires.
-        self.assertEqual(selector.combine_selections(v3_sel, set(), v3_engine=eng), {1, 2})
         # When empty_guard is disabled, returns empty.
         selector.DISABLED.add("empty_guard")
         self.assertEqual(eng.select_commit(p), set())
@@ -399,9 +427,8 @@ class SelectorUnitTests(unittest.TestCase):
                 mock.patch.object(selector, "DATA_DIR", data),
                 mock.patch.object(selector, "SQLGLOT_SRC", src),
                 mock.patch.object(selector, "MAPS_PATH", mp),
-                mock.patch.object(selector, "MAPS_V1_PATH", root / "missing_v1.pkl.zlib"),
                 mock.patch.object(selector, "TRACE", True),
-                mock.patch.dict(os.environ, {"BLAST_TRACE": "1", "BLAST_DISABLE": "union_v1"}),
+                mock.patch.dict(os.environ, {"BLAST_TRACE": "1", "BLAST_DISABLE": "empty_guard"}),
                 mock.patch.object(sys, "stdout", out_buf),
                 mock.patch.object(sys, "stderr", err_buf),
             ):
@@ -458,6 +485,225 @@ class SelectorUnitTests(unittest.TestCase):
             _, rev_imports, _, _, _, _ = build_maps.build_static_graphs(repo)
             self.assertIn("sqlglot/caller.py", rev_imports.get("sqlglot/pkg/__init__.py", []))
             self.assertIn("tests/test_caller.py", rev_imports.get("sqlglot/pkg/__init__.py", []))
+
+    def test_sem_eq_noop_positives_and_negatives(self) -> None:
+        def _find_cmp_site(src: str) -> tuple[int, int, int, int]:
+            m = ast.parse(src)
+            for n in ast.walk(m):
+                if isinstance(n, ast.Compare):
+                    return (n.lineno, n.col_offset, n.end_lineno or n.lineno, n.end_col_offset or n.col_offset)
+            raise AssertionError("no Compare found")
+
+        def _is_sem_eq(old_s: str, new_s: str, *, use_safe_site: bool = False, future: bool = False) -> tuple[bool, set[str]]:
+            om = ast.parse(old_s)
+            nm = ast.parse(new_s)
+            sites = frozenset({_find_cmp_site(old_s)}) if use_safe_site else frozenset()
+            ctx = selector._SemEqCtx(
+                safe_sites=sites,
+                allow_opswap=True,
+                allow_alpha=True,
+                allow_ann=True,
+                future_ann=future or (selector._has_future_annotations(om) and selector._has_future_annotations(nm)),
+            )
+            ok = selector._sem_eq(om, nm, ctx)
+            return ok, set(ctx.kinds)
+
+        # Must be no-op:
+        # 1) x is None -> x == None with site in safe set
+        ok, kinds = _is_sem_eq("def f(x):\n    return x is None\n", "def f(x):\n    return x == None\n", use_safe_site=True)
+        self.assertTrue(ok)
+        self.assertEqual(kinds, {"opswap"})
+
+        # 2) Enum is -> == (and is not -> !=) with site in safe set
+        ok, kinds = _is_sem_eq(
+            "def f(x):\n    return x is Color.RED\n",
+            "def f(x):\n    return x == Color.RED\n",
+            use_safe_site=True,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(kinds, {"opswap"})
+
+        # 3) Local variable alpha-rename
+        ok, kinds = _is_sem_eq(
+            "def f(a):\n    tmp = a + 1\n    return tmp * 2\n",
+            "def f(a):\n    renamed = a + 1\n    return renamed * 2\n",
+        )
+        self.assertTrue(ok)
+        self.assertEqual(kinds, {"alpha"})
+
+        # 4) Local AnnAssign annotation change inside function body
+        ok, kinds = _is_sem_eq(
+            "def f():\n    x: int = 1\n    return x\n",
+            "def f():\n    x: str = 1\n    return x\n",
+        )
+        self.assertTrue(ok)
+        self.assertEqual(kinds, {"annotation"})
+
+        # 5) Signature annotation change with future annotations and no decorator
+        ok, kinds = _is_sem_eq(
+            "from __future__ import annotations\ndef f(x: int) -> str:\n    return str(x)\n",
+            "from __future__ import annotations\ndef f(x: float | int) -> object:\n    return str(x)\n",
+        )
+        self.assertTrue(ok)
+        self.assertEqual(kinds, {"annotation"})
+
+        # Must NOT be no-op:
+        # 6) Op-swap at a site not in safe set
+        ok, _ = _is_sem_eq("def f(x):\n    return x is None\n", "def f(x):\n    return x == None\n", use_safe_site=False)
+        self.assertFalse(ok)
+
+        # 7) Op-swap with a literal operand (x is 1 vs x == 1)
+        ok, _ = _is_sem_eq("def f(x):\n    return x is 1\n", "def f(x):\n    return x == 1\n", use_safe_site=True)
+        self.assertFalse(ok)
+
+        # 9) Parameter rename
+        ok, _ = _is_sem_eq("def f(x):\n    return x + 1\n", "def f(y):\n    return y + 1\n")
+        self.assertFalse(ok)
+
+        # 10) Rename of a local referenced in a nested def / lambda
+        ok, _ = _is_sem_eq(
+            "def f():\n    x = 1\n    g = lambda: x + 1\n    return g()\n",
+            "def f():\n    z = 1\n    g = lambda: z + 1\n    return g()\n",
+        )
+        self.assertFalse(ok)
+        ok, _ = _is_sem_eq(
+            "def f():\n    x = 1\n    def inner():\n        return x + 1\n    return inner()\n",
+            "def f():\n    z = 1\n    def inner():\n        return z + 1\n    return inner()\n",
+        )
+        self.assertFalse(ok)
+
+        # 11) Rename onto a global/builtin used in the function
+        ok, _ = _is_sem_eq(
+            "def f(items):\n    x = len(items)\n    return x + len(items)\n",
+            "def f(items):\n    len = len(items)\n    return len + len(items)\n",
+        )
+        self.assertFalse(ok)
+
+        # 12) Function using locals()
+        ok, _ = _is_sem_eq(
+            "def f():\n    x = 1\n    return locals()\n",
+            "def f():\n    y = 1\n    return locals()\n",
+        )
+        self.assertFalse(ok)
+
+        # 13) except-as rename
+        ok, _ = _is_sem_eq(
+            "def f():\n    try:\n        return 1\n    except ValueError as err:\n        return str(err)\n",
+            "def f():\n    try:\n        return 1\n    except ValueError as exc:\n        return str(exc)\n",
+        )
+        self.assertFalse(ok)
+
+        # 14) f-string {x=} debug specifier rename
+        ok, _ = _is_sem_eq(
+            'def f():\n    x = 1\n    return f"{x=}"\n',
+            'def f():\n    y = 1\n    return f"{y=}"\n',
+        )
+        self.assertFalse(ok)
+
+        # 15) Signature annotation change without future import, or on decorated function
+        ok, _ = _is_sem_eq(
+            "def f(x: int) -> str:\n    return str(x)\n",
+            "def f(x: float) -> str:\n    return str(x)\n",
+        )
+        self.assertFalse(ok)
+        ok, _ = _is_sem_eq(
+            "from __future__ import annotations\n@dec\ndef f(x: int) -> str:\n    return str(x)\n",
+            "from __future__ import annotations\n@dec\ndef f(x: float) -> str:\n    return str(x)\n",
+        )
+        self.assertFalse(ok)
+
+        # 16) Class-level AnnAssign change (including class defined inside a function)
+        ok, _ = _is_sem_eq(
+            "from __future__ import annotations\nclass C:\n    x: int = 1\n",
+            "from __future__ import annotations\nclass C:\n    x: str = 1\n",
+        )
+        self.assertFalse(ok)
+        ok, _ = _is_sem_eq(
+            "from __future__ import annotations\ndef f():\n    class Inner:\n        x: int = 1\n    return Inner\n",
+            "from __future__ import annotations\ndef f():\n    class Inner:\n        x: str = 1\n    return Inner\n",
+        )
+        self.assertFalse(ok)
+
+        # 17) is -> == mixed with a real change in the same file
+        ok, _ = _is_sem_eq(
+            "def f(x):\n    return x is None\ndef g():\n    return 1\n",
+            "def f(x):\n    return x == None\ndef g():\n    return 2\n",
+            use_safe_site=True,
+        )
+        self.assertFalse(ok)
+
+    def test_semantic_noop_engine_guards_and_trace(self) -> None:
+        eng = _make_mini_engine()
+        src_a = (
+            "class Widget:\n"
+            "    def compute(self, x):\n"
+            "        if x is None:\n"
+            "            return 1\n"
+            "        return 0\n"
+        )
+        eng._ast_cache["sqlglot/mod_a.py"] = (src_a, ast.parse(src_a))
+        eng._ast_cache["sqlglot/typing/foo.py"] = ("X = 1\n", ast.parse("X = 1\n"))
+        eng.raw_line_cov["sqlglot/mod_a.py"] = {"3": [0], "4": [0]}
+        eng._line_cache.clear()
+        cmp_node = next(n for n in ast.walk(ast.parse(src_a)) if isinstance(n, ast.Compare))
+        eng.eq_safe_sites = {
+            "sqlglot/mod_a.py": frozenset({
+                (cmp_node.lineno, cmp_node.col_offset, cmp_node.end_lineno, cmp_node.end_col_offset)
+            })
+        }
+
+        p_one = (
+            "diff --git a/sqlglot/mod_a.py b/sqlglot/mod_a.py\n"
+            "--- a/sqlglot/mod_a.py\n"
+            "+++ b/sqlglot/mod_a.py\n"
+            "@@ -2,3 +2,3 @@ class Widget:\n"
+            "     def compute(self, x):\n"
+            "-        if x is None:\n"
+            "+        if x == None:\n"
+            "             return 1\n"
+        )
+        # Single-section safe opswap -> empty selection + trace note.
+        selector.TRACE = True
+        self.assertEqual(eng.select_commit(p_one), set())
+        self.assertTrue(any("semantic_noop:sqlglot/mod_a.py:opswap" == r for r in eng.reasons))
+
+        # Disabled -> falls back to line coverage {0}.
+        selector.DISABLED.add("noop_opswap")
+        self.assertEqual(eng.select_commit(p_one), {0})
+        selector.DISABLED.clear()
+
+        # 8) Op-swap in a 2-section patch -> must NOT apply opswap!
+        p_two = p_one + (
+            "diff --git a/sqlglot/typing/foo.py b/sqlglot/typing/foo.py\n"
+            "--- a/sqlglot/typing/foo.py\n"
+            "+++ b/sqlglot/typing/foo.py\n"
+            "@@ -1 +1 @@\n"
+            "-X = 1\n"
+            "+X = 2\n"
+        )
+        self.assertIn(0, eng.select_commit(p_two))
+
+        # Child-record failure fallback adds subprocess_test_ids when opswap fires.
+        eng.eq_sites_stats = {"child_records": []}
+        eng.subprocess_test_ids = ["tests/test_beta.py::TestBeta::test_c"]
+        eng._subprocess_livemask = None
+        self.assertEqual(eng.select_commit(p_one), {2})
+
+        # Never applies to test files even if opswap/alpha exists inside a test method.
+        test_src = "class TestAlpha:\n    def test_a(self):\n        v = 1\n        assert v == 1\n"
+        eng._ast_cache["tests/test_alpha.py"] = (test_src, ast.parse(test_src))
+        p_test = (
+            "diff --git a/tests/test_alpha.py b/tests/test_alpha.py\n"
+            "--- a/tests/test_alpha.py\n"
+            "+++ b/tests/test_alpha.py\n"
+            "@@ -2,3 +2,3 @@ class TestAlpha:\n"
+            "     def test_a(self):\n"
+            "-        v = 1\n"
+            "-        assert v == 1\n"
+            "+        w = 1\n"
+            "+        assert w == 1\n"
+        )
+        self.assertEqual(eng.select_commit(p_test), {0})
 
 
 if __name__ == "__main__":

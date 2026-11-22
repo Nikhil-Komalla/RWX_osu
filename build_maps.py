@@ -20,8 +20,13 @@ Outputs RWX_track/maps/blast_maps.pkl.zlib containing ONLY baseline commit facts
   - metaclass_attrs: list[str]
   - once_lines: {rel_path: [lineno_int, ...]} lines executed once per process (import / class creation /
     metaclass hooks / memoized builders); per-test coverage under-attributes them (version 3)
+  - collection_lines: {rel_path: {lineno_int: [test_rel_path, ...]}} sqlglot lines executed during test
+    file collection / import (version 4)
   - lazy_test_importers: {rel_path: [test_rel_path, ...]} reached only via lazy/dynamic imports
   - path_mentions: {top_level_entry: [test_rel_path, ...]} for files outside sqlglot/ and tests/
+  - eq_safe_sites: {rel_path: frozenset[(lineno, col, end_lineno, end_col)]} dynamically proven safe Compare sites (version 4)
+  - eq_sites_stats: summary dict from --eqsites-only pass (version 4)
+  - subprocess_test_ids: list[str] of tests referencing subprocess/Popen/os.system/sys.executable (version 4)
 
 Refresh only the probe-derived keys on an existing maps file:
   python build_maps.py --augment <sqlglot_repo> maps/blast_maps.pkl.zlib [cache_dir]
@@ -1245,14 +1250,38 @@ def build_lazy_test_importers(repo: pathlib.Path, rev_imports: Dict[str, List[st
 
 
 _ONCE_PROBE_SCRIPT = r'''
-import importlib, json, os, pkgutil, sys, warnings
+import importlib, json, os, pathlib, pkgutil, sys, warnings
 warnings.simplefilter("ignore")
 repo, out = sys.argv[1], sys.argv[2]
-sys.path.insert(0, repo)
-os.chdir(repo)
+repo_path = pathlib.Path(repo).resolve()
+sys.path.insert(0, str(repo_path))
+os.chdir(repo_path)
 import coverage
-cov = coverage.Coverage(data_file=None, source=[os.path.join(repo, "sqlglot")], branch=False)
+cov = coverage.Coverage(data_file=None, source=[os.path.join(str(repo_path), "sqlglot")], branch=False)
 cov.start()
+
+cov.switch_context("imp")
+import sqlglot
+from sqlglot import exp
+from sqlglot.dialects.dialect import Dialect, Dialects
+for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
+    if info.name == "sqlglot.__main__":
+        continue
+    try:
+        importlib.import_module(info.name)
+    except Exception:
+        pass
+
+tests_root = repo_path / "tests"
+for test_file in sorted(tests_root.rglob("test_*.py"), key=lambda p: p.as_posix()):
+    rel = test_file.relative_to(repo_path).as_posix()
+    modname = rel[:-3].replace("/", ".")
+    cov.switch_context("col:" + rel)
+    try:
+        importlib.import_module(modname)
+    except Exception:
+        pass
+
 SQLS = [
     "SELECT a, b + 1 AS c, 'x' AS s, CAST(d AS INT) FROM t AS x JOIN u ON x.a = u.a WHERE c = 1 GROUP BY a ORDER BY b LIMIT 5",
     "INSERT INTO t (a) VALUES (1)",
@@ -1260,19 +1289,8 @@ SQLS = [
     "WITH q AS (SELECT 1 AS a) SELECT SUM(a) OVER (PARTITION BY a) FROM q UNION ALL SELECT 2",
 ]
 
-def _round(tag, first):
+def _round(tag):
     cov.switch_context(tag)
-    import sqlglot
-    from sqlglot import exp
-    from sqlglot.dialects.dialect import Dialect, Dialects
-    if first:
-        for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
-            if info.name == "sqlglot.__main__":
-                continue
-            try:
-                importlib.import_module(info.name)
-            except Exception:
-                pass
     from sqlglot.optimizer import optimize
     for d in [""] + [x.value for x in Dialects if x.value]:
         try:
@@ -1295,36 +1313,45 @@ def _round(tag, first):
     except Exception:
         pass
 
-_round("r1", True)
-_round("r2", False)
+_round("r1")
+_round("r2")
 cov.stop()
 data = cov.get_data()
-res = {}
+once_out = {}
+collect_out = {}
 for fname in data.measured_files():
-    rel = os.path.relpath(fname, repo).replace(os.sep, "/")
+    rel = os.path.relpath(fname, str(repo_path)).replace(os.sep, "/")
     if not rel.startswith("sqlglot/"):
         continue
-    r1, r2 = set(), set()
+    imp, r1, r2 = set(), set(), set()
+    col_map = {}
     for ln, ctxs in data.contexts_by_lineno(fname).items():
+        if "imp" in ctxs:
+            imp.add(ln)
         if "r1" in ctxs:
             r1.add(ln)
         if "r2" in ctxs:
             r2.add(ln)
-    once = sorted(r1 - r2)
+        cols = sorted(c[4:] for c in ctxs if c.startswith("col:"))
+        if cols:
+            col_map[str(ln)] = cols
+    once = sorted(imp | (r1 - r2))
     if once:
-        res[rel] = once
+        once_out[rel] = once
+    if col_map:
+        collect_out[rel] = col_map
 with open(out, "w") as f:
-    json.dump(res, f)
+    json.dump({"once": once_out, "collect": collect_out}, f)
 '''
 
 
-def run_once_lines_probe(repo: pathlib.Path, cache_dir: pathlib.Path) -> Dict[str, List[int]]:
-    """Lines executed only ONCE per process (import time, class creation, metaclass / __init_subclass__
-    hooks, factory outer bodies, memoized builders such as generator._build_dispatch).
+def run_once_lines_probe(
+    repo: pathlib.Path, cache_dir: pathlib.Path
+) -> Tuple[Dict[str, List[int]], Dict[str, Dict[int, List[str]]]]:
+    """Detect lines executed at import time, test-collection time, or once per process.
 
-    Per-test coverage attributes such lines only to whichever test happened to trigger them first, so a
-    line-coverage lookup on them under-selects. Detected by running the same warm-up workload twice in one
-    fresh interpreter: lines seen in round 1 but never in round 2 are once-per-process lines.
+    - `once_lines`: lines executed during sqlglot package import (`imp`) or only in warm-up round 1 (`r1 - r2`).
+    - `collection_lines`: {rel_path: {lineno: [test_rel_path, ...]}} hit while importing each `tests/**/test_*.py`.
     """
     import subprocess
 
@@ -1337,13 +1364,18 @@ def run_once_lines_probe(repo: pathlib.Path, cache_dir: pathlib.Path) -> Dict[st
     t0 = time.perf_counter()
     subprocess.check_call([sys.executable, str(script), str(repo), str(out)], env=env, cwd=str(repo))
     res = json.loads(out.read_text("utf-8"))
+    once_lines = {k: [int(x) for x in v] for k, v in res.get("once", {}).items()}
+    collection_lines = {
+        k: {int(ln): list(tfs) for ln, tfs in d.items()} for k, d in res.get("collect", {}).items()
+    }
+    col_line_cnt = sum(len(d) for d in collection_lines.values())
     print(
-        f"[Pass 4] once-per-process probe: {len(res)} files, {sum(len(v) for v in res.values())} lines "
-        f"in {time.perf_counter() - t0:.1f}s",
+        f"[Pass 4] once+collect probe: once={len(once_lines)} files / {sum(len(v) for v in once_lines.values())} lines, "
+        f"collect={len(collection_lines)} files / {col_line_cnt} lines in {time.perf_counter() - t0:.1f}s",
         file=sys.stderr,
         flush=True,
     )
-    return {k: [int(x) for x in v] for k, v in res.items()}
+    return once_lines, collection_lines
 
 
 def build_path_mentions(repo: pathlib.Path) -> Dict[str, List[str]]:
@@ -1369,6 +1401,458 @@ def build_path_mentions(repo: pathlib.Path) -> Dict[str, List[str]]:
     return out
 
 
+_SITECUSTOMIZE_CODE = """\
+import os
+
+if os.environ.get("BLAST_EQ_OUT") and os.environ.get("BLAST_EQ_REPO"):
+    import eqsite_hook
+
+    eqsite_hook.install()
+"""
+
+_EQSITE_HOOK_CODE = r'''
+from __future__ import annotations
+
+import ast
+import atexit
+import builtins
+import importlib.abc
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import sys
+import types
+from typing import Any, Dict, Optional, Set, Tuple
+
+_OP_NAMES: Dict[type, str] = {
+    ast.Is: "is",
+    ast.IsNot: "is not",
+    ast.Eq: "==",
+    ast.NotEq: "!=",
+}
+_ALLOWED_OWNERS = frozenset({object, type(None), bool, int, float, complex, str, bytes})
+_FAST_SAFE_TYPES = frozenset({type(None), bool, int, float, complex, str, bytes})
+_METHOD_TYPES = (types.FunctionType, classmethod, staticmethod)
+
+_seen: Set[Tuple[str, int, int, int, int]] = set()
+_unsafe: Set[Tuple[str, int, int, int, int]] = set()
+_transformed_modules: Set[str] = set()
+_type_safe_cache: Dict[type, bool] = {}
+_installed = False
+
+
+def _is_type_safe(cls: type) -> bool:
+    if cls in _FAST_SAFE_TYPES:
+        return True
+    cached = _type_safe_cache.get(cls)
+    if cached is not None:
+        return cached
+    ok = True
+    for aname in ("__eq__", "__ne__"):
+        owner = None
+        val = None
+        for k in cls.__mro__:
+            d = k.__dict__
+            if aname in d:
+                owner = k
+                val = d[aname]
+                break
+        if owner not in _ALLOWED_OWNERS or isinstance(val, _METHOD_TYPES):
+            ok = False
+            break
+    _type_safe_cache[cls] = ok
+    return ok
+
+
+def _cmp(rel: str, lineno: int, col: int, end_lineno: int, end_col: int, op: str, a: Any, b: Any) -> Any:
+    key = (rel, lineno, col, end_lineno, end_col)
+    _seen.add(key)
+    try:
+        if op == "is":
+            res = a is b
+        elif op == "is not":
+            res = a is not b
+        elif op == "==":
+            res = a == b
+        else:
+            res = a != b
+    except BaseException:
+        _unsafe.add(key)
+        raise
+
+    if key not in _unsafe:
+        if not (_is_type_safe(type(a)) and _is_type_safe(type(b))):
+            _unsafe.add(key)
+        else:
+            try:
+                if op == "is":
+                    alt = a == b
+                elif op == "is not":
+                    alt = a != b
+                elif op == "==":
+                    alt = a is b
+                else:
+                    alt = a is not b
+                if type(res) is not bool or type(alt) is not bool or res != alt:
+                    _unsafe.add(key)
+            except Exception:
+                _unsafe.add(key)
+    return res
+
+
+class _EqTransformer(ast.NodeTransformer):
+    def __init__(self, rel: str) -> None:
+        self.rel = rel
+
+    def _visit_arguments(self, args: ast.arguments) -> None:
+        # Never transform type annotations on arguments; only defaults are evaluated at def time.
+        args.defaults = [self.visit(d) for d in args.defaults]
+        args.kw_defaults = [self.visit(d) if d is not None else None for d in args.kw_defaults]
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        node.decorator_list = [self.visit(d) for d in node.decorator_list]
+        self._visit_arguments(node.args)
+        node.body = [self.visit(s) for s in node.body]
+        return node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        node.decorator_list = [self.visit(d) for d in node.decorator_list]
+        self._visit_arguments(node.args)
+        node.body = [self.visit(s) for s in node.body]
+        return node
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
+        node.decorator_list = [self.visit(d) for d in node.decorator_list]
+        node.bases = [self.visit(b) for b in node.bases]
+        node.keywords = [self.visit(k) for k in node.keywords]
+        node.body = [self.visit(s) for s in node.body]
+        return node
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST:
+        node.target = self.visit(node.target)
+        if node.value is not None:
+            node.value = self.visit(node.value)
+        return node
+
+    def visit_Compare(self, node: ast.Compare) -> ast.AST:
+        self.generic_visit(node)
+        if len(node.ops) == 1 and len(node.comparators) == 1:
+            op_name = _OP_NAMES.get(type(node.ops[0]))
+            if op_name is not None:
+                lineno = getattr(node, "lineno", 0) or 0
+                col = getattr(node, "col_offset", 0) or 0
+                end_lineno = getattr(node, "end_lineno", lineno) or lineno
+                end_col = getattr(node, "end_col_offset", col) or col
+                call = ast.Call(
+                    func=ast.Name(id="__blast_cmp__", ctx=ast.Load()),
+                    args=[
+                        ast.Constant(self.rel),
+                        ast.Constant(lineno),
+                        ast.Constant(col),
+                        ast.Constant(end_lineno),
+                        ast.Constant(end_col),
+                        ast.Constant(op_name),
+                        node.left,
+                        node.comparators[0],
+                    ],
+                    keywords=[],
+                )
+                return ast.copy_location(call, node)
+        return node
+
+
+def _transform_source(src: str, rel: str) -> ast.AST:
+    tree = ast.parse(src)
+    tree = _EqTransformer(rel).visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
+class _EqSiteLoader(importlib.machinery.SourceFileLoader):
+    def __init__(self, fullname: str, path: str, rel: str) -> None:
+        super().__init__(fullname, path)
+        self.rel = rel
+
+    def get_code(self, fullname: str) -> Any:
+        data = self.get_data(self.path)
+        src = importlib.util.decode_source(data)
+        tree = _transform_source(src, self.rel)
+        _transformed_modules.add(self.rel)
+        return compile(tree, self.path, "exec", dont_inherit=True)
+
+
+class _EqSiteFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, repo_root: pathlib.Path) -> None:
+        self.repo_root = repo_root.resolve()
+        self.repo_sqlglot = (self.repo_root / "sqlglot").resolve()
+
+    def find_spec(self, fullname: str, path: Any, target: Any = None) -> Any:
+        if fullname != "sqlglot" and not fullname.startswith("sqlglot."):
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
+        if spec is None or not spec.origin or not spec.origin.endswith(".py"):
+            return None
+        orig = pathlib.Path(spec.origin).resolve()
+        if not orig.is_relative_to(self.repo_sqlglot):
+            return None
+        rel = orig.relative_to(self.repo_root).as_posix()
+        spec.loader = _EqSiteLoader(fullname, str(orig), rel)
+        return spec
+
+
+def dump_records() -> Optional[pathlib.Path]:
+    out_dir = os.environ.get("BLAST_EQ_OUT")
+    if not out_dir:
+        return None
+    out_path = pathlib.Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    rec_file = out_path / f"rec.{os.getpid()}.json"
+    tmp_file = out_path / f".rec.{os.getpid()}.tmp"
+    payload = {
+        "pid": os.getpid(),
+        "modules": sorted(_transformed_modules),
+        "seen": [list(x) for x in sorted(_seen)],
+        "unsafe": [list(x) for x in sorted(_unsafe)],
+    }
+    tmp_file.write_text(json.dumps(payload), encoding="utf-8")
+    os.replace(tmp_file, rec_file)
+    return rec_file
+
+
+def install() -> None:
+    global _installed
+    if _installed:
+        return
+    repo_str = os.environ.get("BLAST_EQ_REPO")
+    if not repo_str:
+        return
+    _installed = True
+    sys.dont_write_bytecode = True
+    builtins.__blast_cmp__ = _cmp  # type: ignore[attr-defined]
+    sys.meta_path.insert(0, _EqSiteFinder(pathlib.Path(repo_str)))
+    atexit.register(dump_records)
+'''
+
+
+def _prepare_eqhook_dir(workdir: pathlib.Path, clean_records: bool = True) -> Tuple[pathlib.Path, pathlib.Path]:
+    hook_dir = workdir / "eqhook"
+    out_dir = workdir / "eqout"
+    hook_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if clean_records:
+        for old in out_dir.glob("rec.*.json"):
+            old.unlink(missing_ok=True)
+        for old in out_dir.glob(".rec.*.tmp"):
+            old.unlink(missing_ok=True)
+    (hook_dir / "eqsite_hook.py").write_text(_EQSITE_HOOK_CODE.lstrip("\n"), encoding="utf-8")
+    (hook_dir / "sitecustomize.py").write_text(_SITECUSTOMIZE_CODE, encoding="utf-8")
+    return hook_dir, out_dir
+
+
+def build_subprocess_tests(repo: pathlib.Path, test_ids: Optional[List[str]] = None) -> List[str]:
+    """Static AST fallback identifying test IDs that reference subprocess/Popen/os.system/sys.executable."""
+    def _has_subproc_ref(node: ast.AST) -> bool:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and sub.id in ("subprocess", "Popen"):
+                return True
+            if isinstance(sub, ast.Attribute):
+                if isinstance(sub.value, ast.Name):
+                    if sub.value.id == "os" and sub.attr == "system":
+                        return True
+                    if sub.value.id == "sys" and sub.attr == "executable":
+                        return True
+                    if sub.value.id == "subprocess":
+                        return True
+                if sub.attr == "Popen":
+                    return True
+        return False
+
+    matched_prefixes: Set[str] = set()
+    for p in sorted((repo / "tests").rglob("*.py")):
+        rel = p.relative_to(repo).as_posix()
+        try:
+            tree = ast.parse(p.read_text("utf-8", errors="replace"))
+        except SyntaxError:
+            continue
+        file_level_hit = False
+        for stmt in tree.body:
+            if isinstance(stmt, ast.ClassDef):
+                cls_other_hit = False
+                for body_stmt in stmt.body:
+                    if isinstance(body_stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and body_stmt.name.startswith("test_"):
+                        if _has_subproc_ref(body_stmt):
+                            matched_prefixes.add(f"{rel}::{stmt.name}::{body_stmt.name}")
+                    elif _has_subproc_ref(body_stmt):
+                        cls_other_hit = True
+                if cls_other_hit:
+                    matched_prefixes.add(f"{rel}::{stmt.name}::")
+            elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name.startswith("test_"):
+                if _has_subproc_ref(stmt):
+                    matched_prefixes.add(f"{rel}::{stmt.name}")
+            elif _has_subproc_ref(stmt):
+                file_level_hit = True
+        if file_level_hit:
+            matched_prefixes.add(f"{rel}::")
+
+    if test_ids is None:
+        return sorted(matched_prefixes)
+
+    out: List[str] = []
+    for tid in test_ids:
+        for pref in matched_prefixes:
+            if pref.endswith("::"):
+                if tid.startswith(pref):
+                    out.append(tid)
+                    break
+            elif tid == pref or tid.startswith(pref + "["):
+                out.append(tid)
+                break
+    return sorted(out)
+
+
+def _site_dict_to_frozensets(raw: Dict[str, List[List[int]]]) -> Dict[str, Any]:
+    return {
+        rel: frozenset((int(x[0]), int(x[1]), int(x[2]), int(x[3])) for x in coords)
+        for rel, coords in raw.items()
+    }
+
+
+def _main_eqsites() -> None:
+    import pytest
+
+    repo = pathlib.Path(sys.argv[2]).resolve()
+    out_json = pathlib.Path(sys.argv[3]).resolve()
+    workdir = pathlib.Path(sys.argv[4]).resolve()
+    targets = sys.argv[5:] or ["tests"]
+
+    hook_dir, out_dir = _prepare_eqhook_dir(workdir, clean_records=True)
+    os.environ["SKIP_INTEGRATION"] = "0"
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    os.environ["BLAST_EQ_OUT"] = str(out_dir)
+    os.environ["BLAST_EQ_REPO"] = str(repo)
+    py_bin = str(pathlib.Path(sys.executable).parent)
+    old_path = os.environ.get("PATH", "")
+    if py_bin not in old_path.split(os.pathsep):
+        os.environ["PATH"] = f"{py_bin}{os.pathsep}{old_path}" if old_path else py_bin
+    old_pp = os.environ.get("PYTHONPATH", "")
+    pp_parts = [p for p in (str(hook_dir), str(repo)) if p]
+    if old_pp:
+        pp_parts.append(old_pp)
+    os.environ["PYTHONPATH"] = os.pathsep.join(pp_parts)
+
+    if str(hook_dir) not in sys.path:
+        sys.path.insert(0, str(hook_dir))
+    import eqsite_hook  # type: ignore[import-not-found]
+
+    eqsite_hook.install()
+
+    os.chdir(repo)
+    if str(repo) not in sys.path:
+        sys.path.insert(0, str(repo))
+    _install_sync_executor()
+
+    failed_nodeids: List[str] = []
+
+    class _RecPlugin:
+        def pytest_runtest_logreport(self, report):
+            if report.failed:
+                failed_nodeids.append(report.nodeid)
+
+    t0 = time.perf_counter()
+    print(f"[Pass 6 eqsites] Running instrumented pytest on {targets}...", file=sys.stderr, flush=True)
+    rc = pytest.main(["-q", "--no-header", "-p", "no:cacheprovider", *targets], plugins=[_RecPlugin()])
+    dt = time.perf_counter() - t0
+    eqsite_hook.dump_records()
+
+    rec_files = sorted(out_dir.glob("rec.*.json"))
+    all_modules: Set[str] = set()
+    all_seen: Set[Tuple[str, int, int, int, int]] = set()
+    all_unsafe: Set[Tuple[str, int, int, int, int]] = set()
+    main_pid = os.getpid()
+    child_records: List[Dict[str, Any]] = []
+
+    for rf in rec_files:
+        data = json.loads(rf.read_text("utf-8"))
+        mods = set(data.get("modules", ()))
+        seen_t = {(str(x[0]), int(x[1]), int(x[2]), int(x[3]), int(x[4])) for x in data.get("seen", ())}
+        uns_t = {(str(x[0]), int(x[1]), int(x[2]), int(x[3]), int(x[4])) for x in data.get("unsafe", ())}
+        all_modules |= mods
+        all_seen |= seen_t
+        all_unsafe |= uns_t
+        if int(data.get("pid", -1)) != main_pid:
+            child_records.append({
+                "file": rf.name,
+                "pid": data.get("pid"),
+                "modules_count": len(mods),
+                "has_sqlglot_init": "sqlglot/__init__.py" in mods,
+                "seen_count": len(seen_t),
+                "seen_in_sqlglot_init": sum(1 for x in seen_t if x[0] == "sqlglot/__init__.py"),
+                "unsafe_count": len(uns_t),
+            })
+
+    safe_set = all_seen - all_unsafe
+    by_file: Dict[str, List[List[int]]] = defaultdict(list)
+    for rel, l, c, el, ec in sorted(safe_set):
+        by_file[rel].append([l, c, el, ec])
+
+    stats = {
+        "rc": int(rc),
+        "failed_nodeids": sorted(set(failed_nodeids)),
+        "duration_s": round(dt, 2),
+        "transformed_modules_count": len(all_modules),
+        "transformed_modules": sorted(all_modules),
+        "record_files_count": len(rec_files),
+        "child_records": child_records,
+        "seen_count": len(all_seen),
+        "unsafe_count": len(all_unsafe),
+        "safe_count": len(safe_set),
+    }
+    print(
+        f"[Pass 6 eqsites] rc={rc} failed={stats['failed_nodeids']} "
+        f"modules={stats['transformed_modules_count']} rec_files={stats['record_files_count']} "
+        f"child_recs={len(child_records)} seen={stats['seen_count']} "
+        f"unsafe={stats['unsafe_count']} safe={stats['safe_count']} in {dt:.1f}s",
+        file=sys.stderr,
+        flush=True,
+    )
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_json.write_text(json.dumps({"safe_sites": dict(by_file), "stats": stats}), encoding="utf-8")
+    if rc != 0:
+        raise RuntimeError(f"eqsites pytest failed rc={rc}, failed={stats['failed_nodeids']}")
+
+
+def run_eqsite_probe(repo: pathlib.Path, cache_dir: pathlib.Path) -> Dict[str, Any]:
+    """Run full-suite Compare site safety instrumentation in a subprocess and parse the result."""
+    import subprocess
+
+    workdir = cache_dir / "eq_work"
+    out_json = cache_dir / "eq_sites.json"
+    hook_dir, _ = _prepare_eqhook_dir(workdir, clean_records=True)
+    env = dict(os.environ)
+    env["SKIP_INTEGRATION"] = "0"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["BLAST_EQ_OUT"] = str(workdir / "eqout")
+    env["BLAST_EQ_REPO"] = str(repo)
+    py_bin = str(pathlib.Path(sys.executable).parent)
+    old_path = env.get("PATH", "")
+    if py_bin not in old_path.split(os.pathsep):
+        env["PATH"] = f"{py_bin}{os.pathsep}{old_path}" if old_path else py_bin
+    old_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join([str(hook_dir), str(repo)] + ([old_pp] if old_pp else []))
+    cmd = [
+        sys.executable,
+        str(pathlib.Path(__file__).resolve()),
+        "--eqsites-only",
+        str(repo),
+        str(out_json),
+        str(workdir),
+    ]
+    subprocess.check_call(cmd, env=env, cwd=str(repo))
+    return json.loads(out_json.read_text("utf-8"))
+
+
 def _augment_main() -> None:
     """Add/refresh static + probe-derived keys on an existing maps file without re-running pass 1/2."""
     repo = pathlib.Path(sys.argv[2]).resolve()
@@ -1385,10 +1869,15 @@ def _augment_main() -> None:
         payload["metaclass_attrs"],
     ) = build_static_graphs(repo)
     payload["lazy_test_importers"] = build_lazy_test_importers(repo, payload["rev_imports"])
-    payload["once_lines"] = run_once_lines_probe(repo, cache_dir)
+    payload["once_lines"], payload["collection_lines"] = run_once_lines_probe(repo, cache_dir)
     payload["path_mentions"] = build_path_mentions(repo)
     print(f"[Pass 5] path_mentions: {payload['path_mentions']}", file=sys.stderr, flush=True)
-    payload["version"] = max(int(payload.get("version", 2)), 3)
+    eq_res = run_eqsite_probe(repo, cache_dir)
+    payload["eq_safe_sites"] = _site_dict_to_frozensets(eq_res.get("safe_sites", {}))
+    payload["eq_sites_stats"] = eq_res.get("stats", {})
+    payload["subprocess_test_ids"] = build_subprocess_tests(repo, payload.get("test_ids"))
+    print(f"[Pass 6] subprocess_test_ids: {payload['subprocess_test_ids']}", file=sys.stderr, flush=True)
+    payload["version"] = max(int(payload.get("version", 3)), 4)
     raw_bytes = pickle.dumps(payload, protocol=5)
     comp_bytes = zlib.compress(raw_bytes, level=9)
     maps_path.write_bytes(comp_bytes)
@@ -1461,6 +1950,7 @@ def main() -> None:
         metaclass_attrs,
     ) = build_static_graphs(repo)
 
+    once_lines, collection_lines = run_once_lines_probe(repo, cache_dir)
     payload = {
         "version": 2,
         "commit": "eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
@@ -1478,11 +1968,16 @@ def main() -> None:
         "attr_read_lines": attr_read_lines,
         "attr_import_test_files": attr_import_test_files,
         "metaclass_attrs": metaclass_attrs,
-        "once_lines": run_once_lines_probe(repo, cache_dir),
+        "once_lines": once_lines,
+        "collection_lines": collection_lines,
         "path_mentions": build_path_mentions(repo),
         "lazy_test_importers": build_lazy_test_importers(repo, rev_imports),
+        "subprocess_test_ids": build_subprocess_tests(repo, test_ids),
     }
-    payload["version"] = 3
+    eq_res = run_eqsite_probe(repo, cache_dir)
+    payload["eq_safe_sites"] = _site_dict_to_frozensets(eq_res.get("safe_sites", {}))
+    payload["eq_sites_stats"] = eq_res.get("stats", {})
+    payload["version"] = 4
     raw_bytes = pickle.dumps(payload, protocol=5)
     comp_bytes = zlib.compress(raw_bytes, level=9)
     out_path.write_bytes(comp_bytes)
@@ -1529,6 +2024,8 @@ def _main_pass2() -> None:
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "--pass2-only":
         _main_pass2()
+    elif len(sys.argv) >= 2 and sys.argv[1] == "--eqsites-only":
+        _main_eqsites()
     elif len(sys.argv) >= 2 and sys.argv[1] == "--augment":
         _augment_main()
     else:

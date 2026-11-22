@@ -9,6 +9,5 @@ RUN python3 -c "import io, shutil, tarfile, urllib.request; \
     && chmod -R a+rX /app
 COPY maps /app/maps
 COPY selector.py /app/selector.py
-COPY selector_v1.py /app/selector_v1.py
 RUN chmod -R a+rX /app
 CMD ["python", "/app/selector.py"]

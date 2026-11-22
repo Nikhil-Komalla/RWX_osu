@@ -26,8 +26,6 @@ SQLGLOT_SRC = Path(os.environ.get("BLAST_SQLGLOT_DIR", str(DEFAULT_SRC)))
 
 DEFAULT_MAPS = Path(__file__).resolve().parent / "maps" / "blast_maps.pkl.zlib"
 MAPS_PATH = Path(os.environ.get("BLAST_MAPS_PATH", str(DEFAULT_MAPS)))
-DEFAULT_MAPS_V1 = Path(__file__).resolve().parent / "maps" / "blast_maps_v1.pkl.zlib"
-MAPS_V1_PATH = Path(os.environ.get("BLAST_V1_MAPS_PATH", str(DEFAULT_MAPS_V1)))
 
 TRACE = os.environ.get("BLAST_TRACE") == "1"
 DEFAULT_DISABLED: Set[str] = set()
@@ -125,6 +123,409 @@ def _ast_list_eq(xs: Sequence[Any], ys: Sequence[Any]) -> bool:
         if not _ast_eq(x, y):
             return False
     return True
+
+
+_UNSAFE_ALPHA_REFS = frozenset({
+    "locals",
+    "vars",
+    "eval",
+    "exec",
+    "globals",
+    "dir",
+    "_getframe",
+    "currentframe",
+    "f_locals",
+})
+
+
+def _collect_all_ids(node: ast.AST, out: Set[str], unsafe_hit: List[bool]) -> None:
+    """Collect every identifier mentioned anywhere inside a nested scope, flagging dynamic frame/scope calls."""
+    stack: List[ast.AST] = [node]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, ast.Name):
+            out.add(cur.id)
+            if cur.id in _UNSAFE_ALPHA_REFS:
+                unsafe_hit[0] = True
+        elif isinstance(cur, ast.Attribute):
+            if cur.attr in _UNSAFE_ALPHA_REFS:
+                unsafe_hit[0] = True
+        elif isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(cur.name)
+            for tp in getattr(cur, "type_params", ()):
+                tname = getattr(tp, "name", None)
+                if tname:
+                    out.add(tname)
+        elif isinstance(cur, ast.arg):
+            out.add(cur.arg)
+        elif isinstance(cur, ast.ExceptHandler):
+            if cur.name:
+                out.add(cur.name)
+        elif isinstance(cur, (ast.Global, ast.Nonlocal)):
+            out.update(cur.names)
+        elif isinstance(cur, (ast.Import, ast.ImportFrom)):
+            for al in cur.names:
+                out.add(al.asname or al.name.split(".", 1)[0])
+        elif isinstance(cur, (ast.MatchAs, ast.MatchStar)):
+            if cur.name:
+                out.add(cur.name)
+        elif isinstance(cur, ast.MatchMapping):
+            if cur.rest:
+                out.add(cur.rest)
+        stack.extend(ast.iter_child_nodes(cur))
+
+
+def _renamable_locals(fn: ast.AST) -> frozenset[str]:
+    """Return local-only variable names inside fn that can be safely alpha-renamed."""
+    if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return frozenset()
+
+    params: Set[str] = set()
+    args = fn.args
+    for a in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+        params.add(a.arg)
+    if args.vararg is not None:
+        params.add(args.vararg.arg)
+    if args.kwarg is not None:
+        params.add(args.kwarg.arg)
+    for tp in getattr(fn, "type_params", ()):
+        tname = getattr(tp, "name", None)
+        if tname:
+            params.add(tname)
+
+    stores: Set[str] = set()
+    forbidden: Set[str] = set(params) | {"super", "__class__"}
+    nested_ids: Set[str] = set()
+    unsafe_hit = [False]
+
+    # Defaults and decorators execute in the enclosing scope; flag any dynamic reflection there conservatively.
+    for dep in (*fn.decorator_list, *args.defaults, *(d for d in args.kw_defaults if d is not None)):
+        _collect_all_ids(dep, set(), unsafe_hit)
+    if unsafe_hit[0]:
+        return frozenset()
+
+    stack: List[ast.AST] = list(fn.body)
+    while stack:
+        cur = stack.pop()
+        if isinstance(
+            cur,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.Lambda,
+                ast.ListComp,
+                ast.SetComp,
+                ast.DictComp,
+                ast.GeneratorExp,
+            ),
+        ):
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                forbidden.add(cur.name)
+            _collect_all_ids(cur, nested_ids, unsafe_hit)
+            if unsafe_hit[0]:
+                return frozenset()
+            continue
+        if isinstance(cur, ast.Name):
+            if cur.id in _UNSAFE_ALPHA_REFS:
+                return frozenset()
+            if isinstance(cur.ctx, (ast.Store, ast.Del)):
+                stores.add(cur.id)
+        elif isinstance(cur, ast.Attribute):
+            if cur.attr in _UNSAFE_ALPHA_REFS:
+                return frozenset()
+        elif isinstance(cur, ast.ExceptHandler):
+            if cur.name:
+                forbidden.add(cur.name)
+        elif isinstance(cur, (ast.Global, ast.Nonlocal)):
+            forbidden.update(cur.names)
+        elif isinstance(cur, (ast.Import, ast.ImportFrom)):
+            for al in cur.names:
+                forbidden.add(al.asname or al.name.split(".", 1)[0])
+        elif isinstance(cur, (ast.MatchAs, ast.MatchStar)):
+            if cur.name:
+                forbidden.add(cur.name)
+        elif isinstance(cur, ast.MatchMapping):
+            if cur.rest:
+                forbidden.add(cur.rest)
+        stack.extend(ast.iter_child_nodes(cur))
+
+    return frozenset(n for n in stores if n not in forbidden and n not in nested_ids and not n.startswith("__"))
+
+
+def _has_future_annotations(mod: ast.Module) -> bool:
+    for stmt in mod.body:
+        if _is_docstring_stmt(stmt):
+            continue
+        if isinstance(stmt, ast.ImportFrom):
+            if stmt.module == "__future__" and any(a.name == "annotations" for a in stmt.names):
+                return True
+            continue
+        break
+    return False
+
+
+def _is_allowed_opswap_operand(node: ast.AST) -> bool:
+    if isinstance(node, (ast.Name, ast.Attribute, ast.Subscript, ast.Call)):
+        return True
+    if isinstance(node, ast.Constant):
+        return node.value is None or type(node.value) is bool
+    return False
+
+
+class _SemEqCtx:
+    __slots__ = (
+        "safe_sites",
+        "allow_opswap",
+        "allow_alpha",
+        "allow_ann",
+        "future_ann",
+        "old_lines",
+        "new_lines",
+        "frames",
+        "scope_kind",
+        "kinds",
+    )
+
+    def __init__(
+        self,
+        safe_sites: Any = frozenset(),
+        allow_opswap: bool = True,
+        allow_alpha: bool = True,
+        allow_ann: bool = True,
+        future_ann: bool = False,
+        old_lines: Optional[List[str]] = None,
+        new_lines: Optional[List[str]] = None,
+    ) -> None:
+        self.safe_sites = safe_sites
+        self.allow_opswap = allow_opswap
+        self.allow_alpha = allow_alpha
+        self.allow_ann = allow_ann
+        self.future_ann = future_ann
+        self.old_lines = old_lines
+        self.new_lines = new_lines
+        self.frames: List[Optional[Tuple[frozenset[str], frozenset[str], Dict[str, str], Dict[str, str]]]] = []
+        self.scope_kind: str = "module"
+        self.kinds: Set[str] = set()
+
+
+def _sem_eq_args(oa: ast.arguments, na: ast.arguments, ignore_ann: bool, ctx: _SemEqCtx) -> bool:
+    for grp in ("posonlyargs", "args", "kwonlyargs"):
+        xs = getattr(oa, grp)
+        ys = getattr(na, grp)
+        if len(xs) != len(ys):
+            return False
+        for a1, a2 in zip(xs, ys):
+            if a1.arg != a2.arg or getattr(a1, "type_comment", None) != getattr(a2, "type_comment", None):
+                return False
+            if ignore_ann:
+                if not _ast_eq(a1.annotation, a2.annotation):
+                    ctx.kinds.add("annotation")
+            elif not _sem_eq(a1.annotation, a2.annotation, ctx):
+                return False
+    for grp in ("vararg", "kwarg"):
+        a1 = getattr(oa, grp)
+        a2 = getattr(na, grp)
+        if (a1 is None) != (a2 is None):
+            return False
+        if a1 is not None:
+            if a1.arg != a2.arg or getattr(a1, "type_comment", None) != getattr(a2, "type_comment", None):
+                return False
+            if ignore_ann:
+                if not _ast_eq(a1.annotation, a2.annotation):
+                    ctx.kinds.add("annotation")
+            elif not _sem_eq(a1.annotation, a2.annotation, ctx):
+                return False
+    if not _sem_eq(oa.defaults, na.defaults, ctx):
+        return False
+    if not _sem_eq(oa.kw_defaults, na.kw_defaults, ctx):
+        return False
+    return True
+
+
+def _sem_eq(a: Any, b: Any, ctx: _SemEqCtx) -> bool:
+    """Bounded semantic-equivalence AST comparator for verified-safe no-op edits."""
+    if a is b:
+        return True
+    if type(a) is not type(b):
+        return False
+
+    if (
+        ctx.old_lines is not None
+        and ctx.new_lines is not None
+        and (not ctx.frames or ctx.frames[-1] is None)
+        and isinstance(a, ast.stmt)
+        and getattr(a, "col_offset", -1) == getattr(b, "col_offset", -2)
+    ):
+        o0, o1 = _stmt_span(a)
+        n0, n1 = _stmt_span(b)
+        if (o1 - o0) == (n1 - n0) and 1 <= o0 <= o1 <= len(ctx.old_lines) and 1 <= n0 <= n1 <= len(ctx.new_lines):
+            if ctx.old_lines[o0 - 1 : o1] == ctx.new_lines[n0 - 1 : n1]:
+                return True
+
+    if isinstance(a, ast.Compare):
+        if (
+            ctx.allow_opswap
+            and len(a.ops) == 1
+            and len(b.ops) == 1
+            and len(a.comparators) == 1
+            and len(b.comparators) == 1
+            and type(a.ops[0]) is not type(b.ops[0])
+            and {type(a.ops[0]), type(b.ops[0])} in ({ast.Is, ast.Eq}, {ast.IsNot, ast.NotEq})
+        ):
+            site = (
+                getattr(a, "lineno", 0) or 0,
+                getattr(a, "col_offset", 0) or 0,
+                getattr(a, "end_lineno", None) or (getattr(a, "lineno", 0) or 0),
+                getattr(a, "end_col_offset", None) or (getattr(a, "col_offset", 0) or 0),
+            )
+            if (
+                site in ctx.safe_sites
+                and _is_allowed_opswap_operand(a.left)
+                and _is_allowed_opswap_operand(a.comparators[0])
+                and _is_allowed_opswap_operand(b.left)
+                and _is_allowed_opswap_operand(b.comparators[0])
+                and _sem_eq(a.left, b.left, ctx)
+                and _sem_eq(a.comparators[0], b.comparators[0], ctx)
+            ):
+                ctx.kinds.add("opswap")
+                return True
+            return False
+
+    elif isinstance(a, ast.Name):
+        if type(a.ctx) is not type(b.ctx):
+            return False
+        frame = ctx.frames[-1] if ctx.frames else None
+        if frame is None or not ctx.allow_alpha:
+            return a.id == b.id
+        ra, rb, a2b, b2a = frame
+        in_a = a.id in ra
+        in_b = b.id in rb
+        if not in_a and not in_b:
+            return a.id == b.id
+        if in_a and in_b:
+            mapped = a2b.get(a.id)
+            if mapped is not None:
+                if mapped != b.id:
+                    return False
+            elif b.id in b2a:
+                return False
+            else:
+                a2b[a.id] = b.id
+                b2a[b.id] = a.id
+            if a.id != b.id:
+                ctx.kinds.add("alpha")
+            return True
+        return False
+
+    elif isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if a.name != b.name or getattr(a, "type_comment", None) != getattr(b, "type_comment", None):
+            return False
+        if not _sem_eq(a.decorator_list, b.decorator_list, ctx):
+            return False
+        ignore_sig_ann = bool(ctx.allow_ann and ctx.future_ann and not a.decorator_list and not b.decorator_list)
+        if not _sem_eq_args(a.args, b.args, ignore_sig_ann, ctx):
+            return False
+        if ignore_sig_ann:
+            if not _ast_eq(a.returns, b.returns):
+                ctx.kinds.add("annotation")
+        elif not _sem_eq(a.returns, b.returns, ctx):
+            return False
+        if not _sem_eq(getattr(a, "type_params", []), getattr(b, "type_params", []), ctx):
+            return False
+        if (
+            ctx.old_lines is not None
+            and ctx.new_lines is not None
+            and len(a.body) == len(b.body)
+            and a.body
+            and (not ctx.frames or ctx.frames[-1] is None)
+        ):
+            b0 = _stmt_span(a.body[0])[0]
+            b1 = _stmt_span(a.body[-1])[1]
+            nb0 = _stmt_span(b.body[0])[0]
+            nb1 = _stmt_span(b.body[-1])[1]
+            if (b1 - b0) == (nb1 - nb0) and 1 <= b0 <= b1 <= len(ctx.old_lines) and 1 <= nb0 <= nb1 <= len(ctx.new_lines):
+                if ctx.old_lines[b0 - 1 : b1] == ctx.new_lines[nb0 - 1 : nb1]:
+                    return True
+        frame = (_renamable_locals(a), _renamable_locals(b), {}, {}) if ctx.allow_alpha else None
+        prev_scope = ctx.scope_kind
+        ctx.frames.append(frame)
+        ctx.scope_kind = "function"
+        try:
+            return _sem_eq(a.body, b.body, ctx)
+        finally:
+            ctx.scope_kind = prev_scope
+            ctx.frames.pop()
+
+    elif isinstance(a, ast.ClassDef):
+        if a.name != b.name:
+            return False
+        if not (
+            _sem_eq(a.decorator_list, b.decorator_list, ctx)
+            and _sem_eq(a.bases, b.bases, ctx)
+            and _sem_eq(a.keywords, b.keywords, ctx)
+            and _sem_eq(getattr(a, "type_params", []), getattr(b, "type_params", []), ctx)
+        ):
+            return False
+        prev_scope = ctx.scope_kind
+        ctx.frames.append(None)
+        ctx.scope_kind = "class"
+        try:
+            return _sem_eq(a.body, b.body, ctx)
+        finally:
+            ctx.scope_kind = prev_scope
+            ctx.frames.pop()
+
+    elif isinstance(a, ast.Lambda):
+        if not _sem_eq_args(a.args, b.args, False, ctx):
+            return False
+        ctx.frames.append(None)
+        try:
+            return _sem_eq(a.body, b.body, ctx)
+        finally:
+            ctx.frames.pop()
+
+    elif isinstance(a, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        ctx.frames.append(None)
+        try:
+            for f in a._fields:
+                if not _sem_eq(getattr(a, f, None), getattr(b, f, None), ctx):
+                    return False
+            return True
+        finally:
+            ctx.frames.pop()
+
+    elif isinstance(a, ast.AnnAssign):
+        if ctx.allow_ann and ctx.scope_kind == "function" and a.simple and b.simple and isinstance(a.target, ast.Name) and isinstance(b.target, ast.Name):
+            if not (_sem_eq(a.target, b.target, ctx) and _sem_eq(a.value, b.value, ctx)):
+                return False
+            if not _ast_eq(a.annotation, b.annotation):
+                ctx.kinds.add("annotation")
+            return True
+
+    if isinstance(a, ast.AST):
+        fields = a._fields
+        if fields != b._fields:
+            return False
+        for f in fields:
+            if not _sem_eq(getattr(a, f, None), getattr(b, f, None), ctx):
+                return False
+        return True
+    if type(a) is list:
+        if len(a) != len(b):
+            return False
+        return all(_sem_eq(x, y, ctx) for x, y in zip(a, b))
+    return a == b and type(a) is type(b)
+
+
+def _diff_touches_dunder_eq(raw_diff: str) -> bool:
+    for line in raw_diff.splitlines():
+        if (line.startswith("+") and not line.startswith("+++")) or (
+            line.startswith("-") and not line.startswith("---")
+        ):
+            if "__eq__" in line or "__ne__" in line or "__hash__" in line:
+                return True
+    return False
 
 
 def _stmt_span(node: ast.AST) -> Tuple[int, int]:
@@ -710,8 +1111,20 @@ class SelectorEngine:
         self.attr_import_test_files: Dict[str, List[str]] = maps.get("attr_import_test_files", {})
         self.metaclass_attrs: Set[str] = set(maps.get("metaclass_attrs", ()))
         self.raw_once_lines: Dict[str, List[int]] = maps.get("once_lines", {})
+        raw_col = maps.get("collection_lines", {})
+        self.collection_lines: Dict[str, Dict[int, List[str]]] = {
+            rp: {int(ln): list(tfs) for ln, tfs in lmap.items()} for rp, lmap in raw_col.items()
+        }
         self.path_mentions: Dict[str, List[str]] = maps.get("path_mentions", {})
         self.lazy_test_importers: Dict[str, List[str]] = maps.get("lazy_test_importers", {})
+        raw_eq_safe = maps.get("eq_safe_sites", {})
+        self.eq_safe_sites: Dict[str, frozenset[Tuple[int, int, int, int]]] = {
+            rp: (coords if isinstance(coords, frozenset) else frozenset(tuple(x) for x in coords))
+            for rp, coords in raw_eq_safe.items()
+        }
+        self.eq_sites_stats: Dict[str, Any] = maps.get("eq_sites_stats", {})
+        self.subprocess_test_ids: List[str] = list(maps.get("subprocess_test_ids", ()))
+        self._subprocess_livemask: Optional[int] = None
         self._once_cache: Dict[str, frozenset] = {}
         self._pkg_lazy_cache: Dict[str, int] = {}
 
@@ -835,16 +1248,28 @@ class SelectorEngine:
         cached = self._line_cache.get(rel_path)
         if cached is None:
             raw = self.raw_line_cov.get(rel_path)
-            if not raw:
+            cols = self.collection_lines.get(rel_path)
+            if not raw and not cols:
                 cached = {}
-            elif self.is_v2 and isinstance(next(iter(raw.keys())), int) and isinstance(next(iter(raw.values())), int):
-                cached = raw  # type: ignore[assignment]
             else:
-                cached = {}
-                for lns, idxs in raw.items():
-                    m = self._to_mask(idxs)
-                    if m:
-                        cached[int(lns)] = m
+                if not raw:
+                    cached = {}
+                elif self.is_v2 and isinstance(next(iter(raw.keys())), int) and isinstance(next(iter(raw.values())), int):
+                    cached = dict(raw) if cols else raw  # type: ignore[assignment]
+                else:
+                    cached = {}
+                    for lns, idxs in raw.items():
+                        m = self._to_mask(idxs)
+                        if m:
+                            cached[int(lns)] = m
+                if cols:
+                    for ln, tfs in cols.items():
+                        cm = 0
+                        for tf in tfs:
+                            cm |= self.file_to_basemask.get(tf, 0)
+                        if cm:
+                            li = int(ln)
+                            cached[li] = cached.get(li, 0) | cm
             self._line_cache[rel_path] = cached
         return cached
 
@@ -1764,11 +2189,45 @@ class SelectorEngine:
             return fb, fl
 
         base = self._file_access(rel_path)
-        if _ast_eq(old_mod, new_mod):
+        new_lines = new_src.splitlines()
+        if len(old_mod.body) == len(new_mod.body) and all(
+            _node_same_fast(os_, ns_, old_lines, new_lines) for os_, ns_ in zip(old_mod.body, new_mod.body)
+        ):
             self._last_ast_eq = True
             if self._trace:
                 self._note(f"fixture:{rel_path}" if base else f"inert:{rel_path}")
             return base, 0
+
+        if rel_path.startswith("sqlglot/") and self._rule_enabled("semantic_noop"):
+            allow_opswap = (
+                self._rule_enabled("noop_opswap")
+                and self._last_num_sections == 1
+                and not _diff_touches_dunder_eq(raw_diff)
+            )
+            sem_ctx = _SemEqCtx(
+                safe_sites=self.eq_safe_sites.get(rel_path, frozenset()),
+                allow_opswap=allow_opswap,
+                allow_alpha=self._rule_enabled("noop_alpha"),
+                allow_ann=self._rule_enabled("noop_annotation"),
+                future_ann=_has_future_annotations(old_mod) and _has_future_annotations(new_mod),
+                old_lines=old_lines,
+                new_lines=new_lines,
+            )
+            if _sem_eq(old_mod, new_mod, sem_ctx) and sem_ctx.kinds:
+                self._last_ast_eq = True
+                extra_live = 0
+                if "opswap" in sem_ctx.kinds and self.eq_sites_stats and not self.eq_sites_stats.get("child_records"):
+                    if self._subprocess_livemask is None:
+                        m = 0
+                        for tid in self.subprocess_test_ids:
+                            num = self.id_to_num.get(tid)
+                            if num is not None:
+                                m |= 1 << num
+                        self._subprocess_livemask = m
+                    extra_live = self._subprocess_livemask
+                if self._trace:
+                    self._note(f"semantic_noop:{rel_path}:{'+'.join(sorted(sem_ctx.kinds))}")
+                return base, extra_live
 
         live = 0
         # Always check deleted top-level symbols or broken local imports.
@@ -1779,7 +2238,6 @@ class SelectorEngine:
             base |= fb
             live |= fl
 
-        new_lines = new_src.splitlines()
         changed_classes: Set[str] = set()
         mod_change_flag = [False]
         db, dl = self._diff_scope_stmts(
@@ -2125,80 +2583,13 @@ def load_maps(maps_path: Path) -> Dict[str, Any]:
     return json.loads(maps_path.read_text("utf-8"))
 
 
-def load_v1_engine(
-    tests_json: Dict[str, Any],
-    src_root: Path,
-    maps_path: Path = MAPS_V1_PATH,
-) -> Optional[Any]:
-    cur_dis = os.environ.get("BLAST_DISABLE", "")
-    cur_ena = os.environ.get("BLAST_ENABLE", "")
-    ena = {x.strip() for x in cur_ena.split(",") if x.strip()}
-    dis = (DEFAULT_DISABLED - ena) | {x.strip() for x in cur_dis.split(",") if x.strip()}
-    if cur_dis == _INIT_DISABLE_ENV and cur_ena == _INIT_ENABLE_ENV:
-        dis = DISABLED
-    if "union_v1" in dis:
-        return None
-    try:
-        here = str(Path(__file__).resolve().parent)
-        if here not in sys.path:
-            sys.path.insert(0, here)
-        import selector_v1
-        maps_v1 = load_maps(maps_path)
-        return selector_v1.SelectorEngine(tests_json, maps_v1, src_root)
-    except Exception as exc:
-        print(f"[warn] union_v1 disabled: {exc}", file=sys.stderr)
-        return None
-
-
-def combine_selections(
-    v3_sel: Set[int],
-    v1_sel: Set[int],
-    v3_engine: Optional[SelectorEngine] = None,
-    v1_engine: Optional[Any] = None,
-) -> Set[int]:
-    """Union v3 and v1 selections, and apply empty_guard if both returned empty on a changed sqlglot file."""
-    out = set(v3_sel)
-    use_v1 = v3_engine._rule_enabled("union_v1") if v3_engine is not None else ("union_v1" not in DISABLED)
-    if use_v1 and v1_sel:
-        if v3_engine is not None and v3_engine._trace:
-            extra = len(v1_sel - out)
-            if extra:
-                v3_engine._note(f"union_v1:+{extra}")
-        out |= v1_sel
-    use_eg = v3_engine._rule_enabled("empty_guard") if v3_engine is not None else ("empty_guard" not in DISABLED)
-    if use_eg and v3_engine is not None and v3_engine._empty_guard_pending:
-        for rel_path, (eb, el, sec_patch) in v3_engine._empty_guard_pending.items():
-            v1_hit = False
-            if use_v1 and v1_sel:
-                if v1_engine is not None and v3_engine._last_num_sections > 1 and sec_patch:
-                    try:
-                        v1_hit = bool(v1_engine.select_commit(sec_patch))
-                    except Exception:
-                        v1_hit = True
-                else:
-                    v1_hit = True
-            if not v1_hit and (eb or el):
-                out |= v3_engine._decode_masks(eb, el)
-                if v3_engine._trace:
-                    v3_engine._note(f"empty_guard:{rel_path}")
-    return out
-
-
 def select_commit_v4(
-    v3_engine: SelectorEngine,
-    v1_engine: Optional[Any],
+    engine: SelectorEngine,
+    _unused: Optional[Any],
     patch_text: str,
 ) -> Set[int]:
-    """Run v3 + optional v1 union + empty_guard consistently across main() and offline evaluators."""
-    v3_sel = v3_engine.select_commit(patch_text, apply_empty_guard=False)
-    v1_sel: Set[int] = set()
-    if v1_engine is not None and v3_engine._rule_enabled("union_v1"):
-        try:
-            v1_sel = set(v1_engine.select_commit(patch_text))
-        except Exception as exc:
-            print(f"[warn] union_v1 select failed: {exc}", file=sys.stderr)
-            v1_sel = set()
-    return combine_selections(v3_sel, v1_sel, v3_engine=v3_engine, v1_engine=v1_engine)
+    """Compatibility wrapper forwarding to SelectorEngine.select_commit."""
+    return engine.select_commit(patch_text, apply_empty_guard=True)
 
 
 def main() -> None:
@@ -2207,14 +2598,13 @@ def main() -> None:
     maps = load_maps(MAPS_PATH)
 
     engine = SelectorEngine(tests_json, maps, SQLGLOT_SRC)
-    v1_engine = load_v1_engine(tests_json, SQLGLOT_SRC)
     commits_dir = DATA_DIR / "commits"
     patch_files = sorted(commits_dir.glob("*.patch"))
 
     total_selected = 0
     for patch_path in patch_files:
         patch_text = patch_path.read_text("utf-8", errors="replace")
-        sel = select_commit_v4(engine, v1_engine, patch_text)
+        sel = engine.select_commit(patch_text)
         workers = pack_workers(sel, engine.num_to_ms)
         total_selected += len(sel)
         if trace_on:
