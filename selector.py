@@ -5,19 +5,103 @@ from __future__ import annotations
 import ast
 import builtins
 import copy
+import csv
 import difflib
 import enum
 import gzip
+import hashlib
+import importlib.abc
+import importlib.machinery
 import json
 import math
 import os
 import pickle
 import re
+import resource
+import select
+import signal
 import sys
+import time
 import zlib
+
+sys.dont_write_bytecode = True
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
+
+
+def _canon_cell(v: Any) -> str:
+    if v is None:
+        return "N"
+    if isinstance(v, bool):
+        return "B1" if v else "B0"
+    if isinstance(v, int):
+        return f"I{v}"
+    if isinstance(v, float):
+        if math.isnan(v):
+            return "Fnan"
+        if v == 0.0:
+            return "F0.0"
+        return f"F{v:.12g}"
+    if isinstance(v, str):
+        return "S" + repr(v)
+    return f"O{type(v).__name__}:{v!r}"
+
+
+def _canon_digest(obj: Any) -> str:
+    raw = json.dumps(obj, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    return hashlib.sha256(raw).hexdigest()[:32]
+
+
+def _total_cpu_seconds() -> float:
+    s = resource.getrusage(resource.RUSAGE_SELF)
+    c = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return (s.ru_utime + s.ru_stime) + (c.ru_utime + c.ru_stime)
+
+
+class _MemSourceLoader(importlib.machinery.SourceFileLoader):
+    def __init__(self, fullname: str, path: str, data: bytes) -> None:
+        super().__init__(fullname, path)
+        self._data = data
+
+    def path_stats(self, path: str) -> Any:
+        # Force in-memory source execution without reading or writing stale .pyc files.
+        raise OSError("in-memory")
+
+    def get_data(self, path: str) -> bytes:
+        if path == self.path:
+            return self._data
+        return super().get_data(path)
+
+
+class PatchOverlayFinder(importlib.abc.MetaPathFinder):
+    """In-memory overlay MetaPathFinder for patched/added/deleted sqlglot & test modules."""
+
+    def __init__(self, base_dir: Path, patched_files: Dict[str, bytes], deleted_files: Set[str]) -> None:
+        self.base_dir = base_dir
+        self.patched_files = patched_files
+        self.deleted_files = deleted_files
+
+    def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
+        if not (
+            fullname == "sqlglot"
+            or fullname.startswith("sqlglot.")
+            or fullname == "tests"
+            or fullname.startswith("tests.")
+        ):
+            return None
+        mod_rel = fullname.replace(".", "/")
+        for rel, is_pkg in ((mod_rel + "/__init__.py", True), (mod_rel + ".py", False)):
+            if rel in self.deleted_files:
+                raise ModuleNotFoundError(f"Deleted module {fullname}", name=fullname)
+            if rel in self.patched_files:
+                vpath = str(self.base_dir / rel)
+                loader = _MemSourceLoader(fullname, vpath, self.patched_files[rel])
+                spec = importlib.machinery.ModuleSpec(fullname, loader, origin=vpath, is_package=is_pkg)
+                if is_pkg:
+                    spec.submodule_search_locations = [str((self.base_dir / rel).parent)]
+                return spec
+        return None
 
 DATA_DIR = Path(os.environ.get("BLAST_DATA_DIR", "/data"))
 DEFAULT_SRC = Path(__file__).resolve().parent / "sqlglot_src"
@@ -1443,6 +1527,35 @@ class SelectorEngine:
         self.eq_sites_stats: Dict[str, Any] = maps.get("eq_sites_stats", {})
         self.subprocess_test_ids: List[str] = list(maps.get("subprocess_test_ids", ()))
         self._subprocess_livemask: Optional[int] = None
+        _mn_id = "tests/test_parser.py::TestParser::test_max_nodes"
+        _tpcds_id = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+        _tpch_id = "tests/test_executor.py::TestExecutor::test_execute_tpch"
+        self.max_nodes_num: Optional[int] = self.id_to_num.get(_mn_id)
+        self.tpcds_num: Optional[int] = self.id_to_num.get(_tpcds_id)
+        self.tpch_num: Optional[int] = self.id_to_num.get(_tpch_id)
+        _tpcds_bidx = self.id_to_base_idx.get(_tpcds_id)
+        self._tpcds_base_bit: int = (1 << _tpcds_bidx) if _tpcds_bidx is not None else 0
+        self.tpcds_exec_qids: Tuple[int, ...] = tuple(int(x) for x in maps.get("tpcds_exec_qids", ()))
+        self.tpcds_digests: Dict[int, str] = {int(k): str(v) for k, v in maps.get("tpcds_digests", {}).items()}
+        self.tpcds_query_cov: Dict[str, Dict[int, int]] = {
+            rp: {int(ln): int(m) for ln, m in lm.items()} for rp, lm in maps.get("tpcds_query_cov", {}).items()
+        }
+        self.tpcds_parse_cov: Dict[str, FrozenSet[int]] = {
+            rp: frozenset(int(x) for x in lns) for rp, lns in maps.get("tpcds_parse_cov", {}).items()
+        }
+        self.tpch_digests: Tuple[str, ...] = tuple(maps.get("tpch_digests", ()))
+        self.max_nodes_files: FrozenSet[str] = frozenset(maps.get("max_nodes_files", ()))
+        self.probe_cpu_budget_s: float = float(os.environ.get("BLAST_PROBE_BUDGET_S", "45.0"))
+        self.total_probe_cpu_s: float = 0.0
+        self.last_probe_cpu_s: float = 0.0
+        self._tpcds_schema_cache: Optional[Dict[str, Dict[str, str]]] = None
+        self._raw_tpcds_tables: Optional[Dict[str, Tuple[Dict[str, str], List[tuple]]]] = None
+        self._tpcds_sqls_cache: Optional[List[Tuple[bool, str]]] = None
+        self._tpch_sqls_cache: Optional[List[str]] = None
+        self._tpcds_cov_qmask: int = 0
+        self._tpcds_parse_hit: bool = False
+        self._tpcds_unmapped_cov_line: bool = False
+        self._tpcds_non_line: bool = False
         self._once_cache: Dict[Tuple[bool, str], frozenset] = {}
         self._pkg_lazy_cache: Dict[str, int] = {}
         self._mod_users_cache: Dict[str, Tuple[int, int]] = {}
@@ -1510,12 +1623,16 @@ class SelectorEngine:
             raw = self.raw_file_access.get(rel_path)
             cached = self._to_mask(raw) if raw else 0
             self._file_acc_cache[rel_path] = cached
+        if cached & self._tpcds_base_bit:
+            self._tpcds_non_line = True
         return cached
 
     def _dir_walker_tests(self, rel_path: str) -> int:
         parent = rel_path.rsplit("/", 1)[0] if "/" in rel_path else "."
         cached = self._dir_acc_cache.get(parent)
         if cached is not None:
+            if cached & self._tpcds_base_bit:
+                self._tpcds_non_line = True
             return cached
         mask = 0
         if self.raw_dir_access:
@@ -1528,6 +1645,8 @@ class SelectorEngine:
                     if cur in self.raw_dir_access:
                         mask |= self._to_mask(self.raw_dir_access[cur])
         self._dir_acc_cache[parent] = mask
+        if mask & self._tpcds_base_bit:
+            self._tpcds_non_line = True
         return mask
 
     def _pkg_walker_tests(self, rel_path: str) -> int:
@@ -1536,6 +1655,8 @@ class SelectorEngine:
         for pkg, raw in self.raw_pkg_walkers.items():
             if parent == pkg or parent.startswith(pkg + "/"):
                 mask |= self._to_mask(raw)
+        if mask & self._tpcds_base_bit:
+            self._tpcds_non_line = True
         return mask
 
     def _class_usage(self, cls_key: str) -> int:
@@ -1544,6 +1665,8 @@ class SelectorEngine:
             raw = self.raw_class_usage.get(cls_key)
             cached = self._to_mask(raw) if raw else 0
             self._cls_use_cache[cls_key] = cached
+        if cached & self._tpcds_base_bit:
+            self._tpcds_non_line = True
         return cached
 
     def _dict_key_mask(self, attr: str, cls_key: str, norm_key: str) -> int:
@@ -1567,11 +1690,15 @@ class SelectorEngine:
                 alt = by_cls.get(alt_k)
                 if alt:
                     mask |= self._to_mask(alt)
+        if mask & self._tpcds_base_bit:
+            self._tpcds_non_line = True
         return mask
 
     def _attr_reader_mask(self, attr: str) -> int:
         cached = self._attr_reader_cache.get(attr)
         if cached is not None:
+            if cached & self._tpcds_base_bit:
+                self._tpcds_non_line = True
             return cached
         mask = 0
         rmap = self.attr_read_lines.get(attr)
@@ -1579,7 +1706,10 @@ class SelectorEngine:
             for rel, lns in rmap.items():
                 mask |= self._lines_cov(rel, lns)
         for tf in self.attr_import_test_files.get(attr, ()):
-            mask |= self.file_to_basemask.get(tf, 0)
+            bm = self.file_to_basemask.get(tf, 0)
+            if bm & self._tpcds_base_bit:
+                self._tpcds_non_line = True
+            mask |= bm
         self._attr_reader_cache[attr] = mask
         return mask
 
@@ -1621,17 +1751,30 @@ class SelectorEngine:
                 m |= lm
             cached = m
             self._mod_cov_cache[rel_path] = cached
+        if cached & self._tpcds_base_bit:
+            self._tpcds_non_line = True
         return cached
 
     def _lines_cov(self, rel_path: str, lines: Iterable[int]) -> int:
         lmap = self._line_map(rel_path)
         if not lmap:
             return 0
+        tbit = self._tpcds_base_bit
+        qcov = self.tpcds_query_cov.get(rel_path)
+        pcov = self.tpcds_parse_cov.get(rel_path)
         m = 0
         for ln in lines:
             v = lmap.get(ln)
             if v:
                 m |= v
+                if tbit and (v & tbit):
+                    qm = qcov.get(ln, 0) if qcov else 0
+                    if qm:
+                        self._tpcds_cov_qmask |= qm
+                    elif pcov and ln in pcov:
+                        self._tpcds_parse_hit = True
+                    else:
+                        self._tpcds_unmapped_cov_line = True
         return m
 
     def _baseline_src_ast_lines(self, rel_path: str) -> Tuple[str, Optional[ast.Module], List[str]]:
@@ -3348,12 +3491,424 @@ class SelectorEngine:
 
         return tot_b, tot_l
 
+    def _packed_cost_ms(self, sel: Set[int]) -> int:
+        if not sel:
+            return 0
+        bins = pack_workers(sel, self.num_to_ms)
+        if not bins:
+            return 0
+        return max(sum(self.num_to_ms[n] for n in b) for b in bins) + WORKER_COST_MS * len(bins)
+
+    def _load_tpcds_schema(self) -> Dict[str, Dict[str, str]]:
+        if self._tpcds_schema_cache is None:
+            helpers_src = self._read_src("tests/helpers.py")
+            tree = ast.parse(helpers_src)
+            schema: Optional[Dict[str, Dict[str, str]]] = None
+            for node in tree.body:
+                if (
+                    isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "TPCDS_SCHEMA"
+                ):
+                    schema = ast.literal_eval(node.value)
+                    break
+            if not isinstance(schema, dict):
+                raise RuntimeError("TPCDS_SCHEMA not found")
+            self._tpcds_schema_cache = schema
+        return self._tpcds_schema_cache
+
+    @staticmethod
+    def _parse_sql_fixture_pairs(path: Path) -> List[Tuple[bool, str]]:
+        text = path.read_text("utf-8", errors="replace")
+        filtered = "\n".join(line for line in text.splitlines() if line and not line.startswith("--"))
+        stmts = filtered.split(";")
+        out: List[Tuple[bool, str]] = []
+        for i in range(0, len(stmts), 2):
+            if i + 1 < len(stmts):
+                sql_lines = stmts[i].strip().split("\n")
+                meta: Dict[str, str] = {}
+                j = 0
+                while j < len(sql_lines) and sql_lines[j].startswith("#"):
+                    k, v = sql_lines[j].split(":", 1)
+                    meta[k.lstrip("#").strip()] = v.strip()
+                    j += 1
+                sql = "\n".join(sql_lines[j:])
+                ev = meta.get("execute", "")
+                is_exec = bool(ev) and ev.strip().lower() in ("true", "1")
+                out.append((is_exec, sql))
+        return out
+
+    def _get_tpcds_sqls(self) -> List[Tuple[bool, str]]:
+        if self._tpcds_sqls_cache is None:
+            self._tpcds_sqls_cache = self._parse_sql_fixture_pairs(
+                self.src_root / "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
+            )
+        return self._tpcds_sqls_cache
+
+    def _get_tpch_sqls(self) -> List[str]:
+        if self._tpch_sqls_cache is None:
+            self._tpch_sqls_cache = [
+                sql
+                for _, sql in self._parse_sql_fixture_pairs(
+                    self.src_root / "tests/fixtures/optimizer/tpc-h/tpc-h.sql"
+                )
+            ]
+        return self._tpch_sqls_cache
+
+    def _ensure_raw_tpcds_tables(self) -> Dict[str, Tuple[Dict[str, str], List[tuple]]]:
+        if self._raw_tpcds_tables is None:
+            schema = self._load_tpcds_schema()
+            dir_tpcds = self.src_root / "tests/fixtures/optimizer/tpc-ds"
+            raw_tables: Dict[str, Tuple[Dict[str, str], List[tuple]]] = {}
+            for table, columns in schema.items():
+                fn = dir_tpcds / f"{table}.csv.gz"
+                with open(fn, "rb") as fb:
+                    is_gz = fb.read(2) == b"\x1f\x8b"
+                opener = gzip.open(fn, "rt", newline="") if is_gz else open(fn, encoding="utf-8", newline="")
+                with opener as f:
+                    reader = csv.reader(f, delimiter="|")
+                    rows: List[tuple] = []
+                    ctypes: List[Any] = []
+                    next(reader)
+                    for row in reader:
+                        if not ctypes:
+                            for v in row:
+                                try:
+                                    ctypes.append(type(ast.literal_eval(v)))
+                                except (ValueError, SyntaxError):
+                                    ctypes.append(str)
+                        rows.append(
+                            tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row))
+                        )
+                    raw_tables[table] = (columns, rows)
+            self._raw_tpcds_tables = raw_tables
+        return self._raw_tpcds_tables
+
+    def _maybe_run_dynamic_probes(self, sel: Set[int], sections: List[Dict[str, Any]]) -> Set[int]:
+        if not (self.src_root / "sqlglot/__init__.py").is_file():
+            return sel
+        patched: Dict[str, bytes] = {}
+        deleted: Set[str] = set()
+        touched_sqlglot: Set[str] = set()
+
+        for sec in sections:
+            if sec.get("binary"):
+                return sel
+            rp = sec.get("rel_path", "")
+            ap = sec.get("a_path", "")
+            status = sec.get("status", "modified")
+            is_rename = bool(sec.get("renamed") or (ap and rp and ap != rp))
+            if not rp:
+                continue
+            fname = rp.rsplit("/", 1)[-1]
+            ext = ("." + fname.rsplit(".", 1)[-1].lower()) if "." in fname else ""
+            is_inert = ext in _INERT_EXTS or fname in _INERT_NAMES or rp.startswith(("docs/", ".github/"))
+            if is_inert and not (is_rename and ap.startswith("sqlglot/")):
+                continue
+
+            if is_rename and ap != rp:
+                if ap.startswith("sqlglot/") and ap.endswith(".py"):
+                    deleted.add(ap)
+                    touched_sqlglot.add(ap)
+                elif not (ap.startswith("tests/fixtures/") and "tpc-ds" not in ap and "tpc-h" not in ap):
+                    af = ap.rsplit("/", 1)[-1]
+                    ae = ("." + af.rsplit(".", 1)[-1].lower()) if "." in af else ""
+                    if ae not in _INERT_EXTS and af not in _INERT_NAMES and not ap.startswith(("docs/", ".github/")):
+                        return sel
+                if rp.startswith("sqlglot/") and rp.endswith(".py"):
+                    old_txt = self._read_src(ap)
+                    if not old_txt and not (self.src_root / ap).is_file():
+                        return sel
+                    ns, ok = apply_hunks_in_memory(old_txt, sec["hunks"])
+                    if not ok:
+                        return sel
+                    patched[rp] = ns.encode("utf-8")
+                    touched_sqlglot.add(rp)
+                elif not (is_inert or (rp.startswith("tests/fixtures/") and "tpc-ds" not in rp and "tpc-h" not in rp)):
+                    return sel
+                continue
+
+            if rp.startswith("sqlglot/") and rp.endswith(".py"):
+                touched_sqlglot.add(rp)
+                if status == "deleted":
+                    deleted.add(rp)
+                elif status == "added":
+                    ns, ok = apply_hunks_in_memory("", sec["hunks"])
+                    if not ok:
+                        return sel
+                    patched[rp] = ns.encode("utf-8")
+                else:
+                    old_txt = self._read_src(rp)
+                    if not old_txt and not (self.src_root / rp).is_file():
+                        return sel
+                    ns, ok = apply_hunks_in_memory(old_txt, sec["hunks"])
+                    if not ok:
+                        return sel
+                    patched[rp] = ns.encode("utf-8")
+            elif rp.startswith("tests/fixtures/") and "tpc-ds" not in rp and "tpc-h" not in rp:
+                continue
+            else:
+                return sel
+
+        sim_cur = set(sel)
+        rem_budget = max(0.0, self.probe_cpu_budget_s - self.total_probe_cpu_s)
+        want_a = False
+        want_b = False
+        want_c = False
+        require_a_for_b = False
+        b_exec_qids: List[int] = []
+
+        if (
+            self.max_nodes_num is not None
+            and self.max_nodes_num in sim_cur
+            and self.max_nodes_files
+            and not (touched_sqlglot & self.max_nodes_files)
+            and rem_budget >= 0.25
+        ):
+            sav_a = self._packed_cost_ms(sim_cur) - self._packed_cost_ms(sim_cur - {self.max_nodes_num})
+            if sav_a > 3000:
+                want_a = True
+                sim_cur.remove(self.max_nodes_num)
+
+        if self.tpcds_num is not None and self.tpcds_num in sim_cur and self.tpcds_digests:
+            if (
+                self._tpcds_non_line
+                or self._tpcds_unmapped_cov_line
+                or (self._tpcds_cov_qmask == 0 and not self._tpcds_parse_hit)
+            ):
+                b_exec_qids = list(self.tpcds_exec_qids)
+            else:
+                b_exec_qids = [q for q in self.tpcds_exec_qids if (self._tpcds_cov_qmask >> q) & 1]
+            est_b = (
+                (0.0 if want_a else 0.20)
+                + 0.18
+                + 0.205 * len(b_exec_qids)
+                + (0.42 if (b_exec_qids and self._raw_tpcds_tables is None) else 0.0)
+            )
+            sav_b = (self._packed_cost_ms(sim_cur) - self._packed_cost_ms(sim_cur - {self.tpcds_num})) / 1000.0
+            thresh_b = max(3.0, est_b + 1.5)
+            est_total_so_far = (0.20 if want_a else 0.0) + est_b
+            if sav_b > thresh_b and rem_budget >= est_total_so_far:
+                want_b = True
+                if want_a:
+                    sav_b_no_a = (self._packed_cost_ms(sel) - self._packed_cost_ms(sel - {self.tpcds_num})) / 1000.0
+                    require_a_for_b = sav_b_no_a <= thresh_b
+                sim_cur.remove(self.tpcds_num)
+
+        if self.tpch_num is not None and self.tpch_num in sim_cur and self.tpch_digests:
+            sav_c = self._packed_cost_ms(sim_cur) - self._packed_cost_ms(sim_cur - {self.tpch_num})
+            est_c_total = (0.20 if want_a else 0.0) + (0.20 if want_b else 0.0) + 0.20
+            if sav_c > 2500 and rem_budget >= est_c_total:
+                want_c = True
+
+        if not (want_a or want_b or want_c):
+            return sel
+
+        cpu0 = _total_cpu_seconds()
+        try:
+            tpcds_sqls = self._get_tpcds_sqls() if want_b else []
+            tpcds_schema = self._load_tpcds_schema() if want_b else {}
+            raw_tables = self._ensure_raw_tpcds_tables() if (want_b and b_exec_qids) else {}
+            tpch_sqls = self._get_tpch_sqls() if want_c else []
+        except Exception:
+            dt = max(0.0, _total_cpu_seconds() - cpu0)
+            self.last_probe_cpu_s = dt
+            self.total_probe_cpu_s += dt
+            return sel
+
+        sys.stdout.flush()
+        sys.stderr.flush()
+        r_fd, w_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r_fd)
+            res: Dict[str, Any] = {}
+            try:
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, 1)
+                os.dup2(devnull, 2)
+                if devnull > 2:
+                    os.close(devnull)
+                sys.dont_write_bytecode = True
+                os.environ["SKIP_INTEGRATION"] = "0"
+                signal.alarm(25)
+
+                for mod_name in [
+                    m
+                    for m in list(sys.modules)
+                    if m == "sqlglot" or m.startswith("sqlglot.") or m == "tests" or m.startswith("tests.")
+                ]:
+                    del sys.modules[mod_name]
+
+                src_str = str(self.src_root)
+                if src_str not in sys.path:
+                    sys.path.insert(0, src_str)
+                sys.meta_path.insert(0, PatchOverlayFinder(self.src_root, patched, deleted))
+
+                if want_a:
+                    try:
+                        import tests.test_parser  # noqa: F401
+                        from sqlglot import exp, parse_one
+                        from sqlglot.errors import ParseError
+
+                        assert isinstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select)
+                        cols500 = [f"col{i}" for i in range(500)]
+                        assert isinstance(
+                            parse_one(f"SELECT {','.join(cols500)} FROM t", max_nodes=1_000_000),
+                            exp.Select,
+                        )
+                        expr = "x" + "=x" * 10
+                        big_sql = f"SELECT {','.join([expr] * 10)}"
+                        try:
+                            parse_one(big_sql, max_nodes=50)
+                            raise AssertionError("expected ParseError for max_nodes=50")
+                        except ParseError as exc:
+                            assert "(50)" in str(exc) and "Maximum number of AST nodes" in str(exc)
+                        try:
+                            parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+                            raise AssertionError("expected ParseError for max_nodes=5")
+                        except ParseError:
+                            pass
+                        assert isinstance(parse_one("SELECT 1, 2, 3"), exp.Select)
+                        res["a"] = True
+                    except BaseException:
+                        res["a"] = False
+
+                if want_b and not (require_a_for_b and res.get("a") is not True):
+                    try:
+                        from sqlglot import exp, find_tables, parse_one, transpile
+                        from sqlglot.executor import execute
+                        from sqlglot.executor.table import Table
+
+                        all_tables = (
+                            {tn: Table(columns=cols, rows=rows) for tn, (cols, rows) in raw_tables.items()}
+                            if b_exec_qids
+                            else {}
+                        )
+                        b_ok = True
+                        for qi in b_exec_qids:
+                            _, sql = tpcds_sqls[qi]
+                            ast_q = pickle.loads(pickle.dumps(parse_one(sql)))
+                            dk_sql = transpile(sql, write="duckdb")[0]
+                            tabs = {t.name: all_tables[t.name] for t in find_tables(ast_q)}
+                            tbl = execute(ast_q, schema=tpcds_schema, tables=tabs)
+                            c_cols = [str(c) for c in tbl.columns]
+                            c_rows = [[_canon_cell(x) for x in r] for r in tbl.rows]
+                            if _canon_digest([dk_sql, c_cols, c_rows]) != self.tpcds_digests[qi]:
+                                b_ok = False
+                                break
+                        if b_ok:
+                            exec_set = set(b_exec_qids)
+                            for qi, (_, sql) in enumerate(tpcds_sqls):
+                                if qi in exec_set:
+                                    continue
+                                ast_q = pickle.loads(pickle.dumps(parse_one(sql)))
+                                if not isinstance(ast_q, exp.Expr):
+                                    b_ok = False
+                                    break
+                        res["b"] = b_ok
+                    except BaseException:
+                        res["b"] = False
+
+                if want_c:
+                    try:
+                        from sqlglot import parse_one
+
+                        c_ok = True
+                        for qi, sql in enumerate(tpch_sqls):
+                            ast_q = pickle.loads(pickle.dumps(parse_one(sql)))
+                            if _canon_digest(ast_q.sql()) != self.tpch_digests[qi]:
+                                c_ok = False
+                                break
+                        res["c"] = c_ok
+                    except BaseException:
+                        res["c"] = False
+            except BaseException:
+                res = {}
+
+            try:
+                os.write(w_fd, json.dumps(res).encode("ascii"))
+            except BaseException:
+                pass
+            try:
+                os.close(w_fd)
+            except BaseException:
+                pass
+            os._exit(0)
+
+        os.close(w_fd)
+        chunks: List[bytes] = []
+        deadline = time.monotonic() + 26.0
+        timed_out = False
+        while True:
+            rem = deadline - time.monotonic()
+            if rem <= 0.0:
+                timed_out = True
+                break
+            ready, _, _ = select.select([r_fd], [], [], rem)
+            if not ready:
+                timed_out = True
+                break
+            b = os.read(r_fd, 65536)
+            if not b:
+                break
+            chunks.append(b)
+        if timed_out:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        os.close(r_fd)
+        os.waitpid(pid, 0)
+
+        dt_cpu = max(0.0, _total_cpu_seconds() - cpu0)
+        self.last_probe_cpu_s = dt_cpu
+        self.total_probe_cpu_s += dt_cpu
+
+        probe_res: Dict[str, Any] = {}
+        if not timed_out and chunks:
+            try:
+                probe_res = json.loads(b"".join(chunks).decode("ascii"))
+            except Exception:
+                probe_res = {}
+
+        out = set(sel)
+        if want_a:
+            if probe_res.get("a") is True and self.max_nodes_num is not None:
+                out.discard(self.max_nodes_num)
+                if self._trace:
+                    self._note("probe_drop:max_nodes")
+            elif self._trace:
+                self._note("probe_keep:max_nodes")
+        if want_b and not (require_a_for_b and probe_res.get("a") is not True):
+            if probe_res.get("b") is True and self.tpcds_num is not None:
+                out.discard(self.tpcds_num)
+                if self._trace:
+                    self._note(f"probe_drop:tpcds:{len(b_exec_qids)}")
+            elif self._trace:
+                self._note(f"probe_keep:tpcds:{len(b_exec_qids)}")
+        if want_c:
+            if probe_res.get("c") is True and self.tpch_num is not None:
+                out.discard(self.tpch_num)
+                if self._trace:
+                    self._note("probe_drop:tpch")
+            elif self._trace:
+                self._note("probe_keep:tpch")
+
+        return out
+
     def select_commit(self, patch_text: str, apply_empty_guard: bool = True) -> Set[int]:
         """Select all potentially impacted test numbers for a single commit patch."""
         self._trace = TRACE or (os.environ.get("BLAST_TRACE") == "1")
         self.reasons = []
         self._reason_seen = set()
         self._empty_guard_pending = {}
+        self.last_probe_cpu_s = 0.0
+        self._tpcds_cov_qmask = 0
+        self._tpcds_parse_hit = False
+        self._tpcds_unmapped_cov_line = False
+        self._tpcds_non_line = False
 
         base_mask = 0
         live_mask = 0
@@ -3548,7 +4103,12 @@ class SelectorEngine:
                     if self._trace:
                         self._note(f"empty_guard:{rp}")
 
-        return self._decode_masks(base_mask, live_mask)
+        sel = self._decode_masks(base_mask, live_mask)
+        if self.tpcds_num is not None and ((live_mask >> self.tpcds_num) & 1):
+            self._tpcds_non_line = True
+        if apply_empty_guard and sel and self._rule_enabled("dynamic_probe"):
+            sel = self._maybe_run_dynamic_probes(sel, sections)
+        return sel
 
 
 def pack_workers(selected_nums: Set[int], num_to_ms: List[int]) -> List[List[int]]:

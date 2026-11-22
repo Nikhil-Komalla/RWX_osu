@@ -1435,6 +1435,166 @@ class SelectorUnitTests(unittest.TestCase):
         self.assertEqual(eng.select_commit(p_fstr), {1})
         selector.DISABLED.discard("noop_fstring")
 
+    @staticmethod
+    def _make_real_engine():
+        tests_json = json.loads((RWX_DIR / "sample/tests.json").read_text("utf-8"))
+        maps = selector.load_maps(RWX_DIR / "maps/blast_maps.pkl.zlib")
+        return selector.SelectorEngine(tests_json, maps, RWX_DIR / "_sqlglot_baseline")
+
+    def test_v8_patch_overlay_finder_isolation(self) -> None:
+        base = RWX_DIR / "_sqlglot_baseline"
+        opt_init = (base / "sqlglot/optimizer/__init__.py").read_text("utf-8")
+        finder = selector.PatchOverlayFinder(
+            base,
+            patched_files={
+                "sqlglot/errors.py": b"class PatchSentinelError(Exception):\n    pass\n",
+                "sqlglot/optimizer/__init__.py": opt_init.encode("utf-8"),
+                "sqlglot/optimizer/zz_v8_mod.py": b"ZZ_VAL = 99\n",
+            },
+            deleted_files={"sqlglot/time.py"},
+        )
+        spec_err = finder.find_spec("sqlglot.errors")
+        self.assertIsNotNone(spec_err)
+        self.assertIsInstance(spec_err.loader, selector._MemSourceLoader)
+
+        spec_pkg = finder.find_spec("sqlglot.optimizer")
+        self.assertIsNotNone(spec_pkg)
+        self.assertEqual(spec_pkg.submodule_search_locations, [str(base / "sqlglot/optimizer")])
+
+        spec_sub = finder.find_spec("sqlglot.optimizer.zz_v8_mod")
+        self.assertIsNotNone(spec_sub)
+
+        with self.assertRaises(ModuleNotFoundError):
+            finder.find_spec("sqlglot.time")
+
+        # Parent process sys.modules remains clean after real engine probe.
+        eng = self._make_real_engine()
+        orig_mods = {m for m in sys.modules if m == "sqlglot" or m.startswith("sqlglot.")}
+        ctx_src = (base / "sqlglot/executor/context.py").read_text("utf-8")
+        ns = ctx_src + "\n    def _zz_v8_noop(self):\n        if False:\n            return 1\n"
+        # Use a harmless branch edit inside execute_tpcds-covered function in executor/context.py
+        target = "class Context:"
+        self.assertIn(target, ctx_src)
+        import difflib
+        ns2 = ctx_src.replace("def __init__(", "def _zz_unused_inner():\n    return 1\n\ndef __init__(", 1) if "def __init__(" in ctx_src else ns
+        diff = (
+            "diff --git a/sqlglot/executor/context.py b/sqlglot/executor/context.py\n"
+            "index 0000000..1111111 100644\n"
+            + "".join(difflib.unified_diff(ctx_src.splitlines(True), ns2.splitlines(True), "a/sqlglot/executor/context.py", "b/sqlglot/executor/context.py", n=3))
+        )
+        _ = eng.select_commit(diff)
+        after_mods = {m for m in sys.modules if m == "sqlglot" or m.startswith("sqlglot.")}
+        self.assertEqual(orig_mods, after_mods)
+
+    def test_v8_tpcds_probe_pass_fail_and_serde(self) -> None:
+        import difflib
+
+        eng = self._make_real_engine()
+        base = RWX_DIR / "_sqlglot_baseline"
+        tpcds_num = eng.tpcds_num
+        self.assertIsNotNone(tpcds_num)
+
+        # 1) Harmless non-noop edit in tpcds-covered executor/context.py -> probe passes & drops #1106
+        ctx_rel = "sqlglot/executor/context.py"
+        ctx_src = (base / ctx_rel).read_text("utf-8")
+        # Inject dead branch inside Context.__init__ covered by tpcds
+        target_line = "        self.tables = tables"
+        self.assertIn(target_line, ctx_src)
+        ctx_new = ctx_src.replace(target_line, "        if False:\n            _zz_tpcds = 1\n" + target_line, 1)
+        patch_ok = (
+            f"diff --git a/{ctx_rel} b/{ctx_rel}\nindex 0000000..1111111 100644\n"
+            + "".join(difflib.unified_diff(ctx_src.splitlines(True), ctx_new.splitlines(True), f"a/{ctx_rel}", f"b/{ctx_rel}", n=3))
+        )
+        selector.TRACE = True
+        sel_ok = eng.select_commit(patch_ok)
+        self.assertNotIn(tpcds_num, sel_ok)
+        self.assertTrue(any(r.startswith("probe_drop:tpcds:") for r in eng.reasons), eng.reasons)
+
+        # 2) Sample 2jrq -> fails at q1 -> keeps #1106
+        p_2jrq = (RWX_DIR / "sample/commits/2jrq.patch").read_text("utf-8")
+        sel_2jrq = eng.select_commit(p_2jrq)
+        self.assertIn(tpcds_num, sel_2jrq)
+        self.assertTrue(any(r.startswith("probe_keep:tpcds:") for r in eng.reasons), eng.reasons)
+
+        # 3) Sample 3utz (serde.py) -> pickle round-trip catches KeyError -> keeps #1106
+        p_3utz = (RWX_DIR / "sample/commits/3utz.patch").read_text("utf-8")
+        sel_3utz = eng.select_commit(p_3utz)
+        self.assertIn(tpcds_num, sel_3utz)
+        self.assertTrue(any(r.startswith("probe_keep:tpcds:") for r in eng.reasons), eng.reasons)
+
+    def test_v8_max_nodes_probe_pass_fail_and_guard(self) -> None:
+        import difflib
+
+        eng = self._make_real_engine()
+        base = RWX_DIR / "_sqlglot_baseline"
+        mn_num = eng.max_nodes_num
+        self.assertIsNotNone(mn_num)
+
+        # 1) Decorator change on non-max_nodes_files (generators/mysql.py) -> Probe A passes & drops #1490
+        mysql_rel = "sqlglot/generators/mysql.py"
+        msrc = (base / mysql_rel).read_text("utf-8")
+        target = "def _str_to_date_sql("
+        if target not in msrc:
+            target = "    def "
+        idx = msrc.index("class MySQLGenerator")
+        def_pos = msrc.index("\n    def ", idx)
+        mnew = msrc[: def_pos + 1] + "    @staticmethod\n" + msrc[def_pos + 1 :]
+        # Instead add a dummy decorator-triggered function at top-level or modify an existing function with a no-op decorator
+        # Use r010-equivalent: modify MySQLGenerator or top-level function with @property? Easier: add dummy @staticmethod helper that parses fine and escalates once/decorator!
+        mnew = msrc.replace("class MySQLGenerator(", "@(lambda c: c)\nclass MySQLGenerator(", 1)
+        patch_mn_ok = (
+            f"diff --git a/{mysql_rel} b/{mysql_rel}\nindex 0000000..1111111 100644\n"
+            + "".join(difflib.unified_diff(msrc.splitlines(True), mnew.splitlines(True), f"a/{mysql_rel}", f"b/{mysql_rel}", n=3))
+        )
+        selector.TRACE = True
+        sel_mn_ok = eng.select_commit(patch_mn_ok)
+        self.assertNotIn(mn_num, sel_mn_ok)
+        self.assertIn("probe_drop:max_nodes", eng.reasons)
+
+        # 2) Broken import in sqlglot/optimizer/__init__.py -> Probe A catches ImportError -> keeps #1490
+        opt_rel = "sqlglot/optimizer/__init__.py"
+        osrc = (base / opt_rel).read_text("utf-8")
+        onew = osrc + "\nfrom sqlglot.optimizer.zz_missing_mod import MissingSym\n"
+        patch_mn_fail = (
+            f"diff --git a/{opt_rel} b/{opt_rel}\nindex 0000000..1111111 100644\n"
+            + "".join(difflib.unified_diff(osrc.splitlines(True), onew.splitlines(True), f"a/{opt_rel}", f"b/{opt_rel}", n=3))
+        )
+        sel_mn_fail = eng.select_commit(patch_mn_fail)
+        self.assertIn(mn_num, sel_mn_fail)
+        self.assertIn("probe_keep:max_nodes", eng.reasons)
+
+        # 3) Edit in sqlglot/tokens.py (in max_nodes_files) -> Probe A NOT attempted -> #1490 kept cleanly
+        tok_rel = "sqlglot/tokens.py"
+        tsrc = (base / tok_rel).read_text("utf-8")
+        tnew = tsrc.replace("if isinstance(item, str)", "if type(item) is str or isinstance(item, str)", 1)
+        patch_tok = (
+            f"diff --git a/{tok_rel} b/{tok_rel}\nindex 0000000..1111111 100644\n"
+            + "".join(difflib.unified_diff(tsrc.splitlines(True), tnew.splitlines(True), f"a/{tok_rel}", f"b/{tok_rel}", n=3))
+        )
+        sel_tok = eng.select_commit(patch_tok)
+        self.assertIn(mn_num, sel_tok)
+        self.assertFalse(any(r.startswith("probe_") for r in eng.reasons), eng.reasons)
+
+    def test_v8_probe_budget_and_disable_toggle(self) -> None:
+        eng = self._make_real_engine()
+        p_2jrq = (RWX_DIR / "sample/commits/2jrq.patch").read_text("utf-8")
+        selector.TRACE = True
+
+        # Budget 0.0 -> skips probing cleanly
+        eng.probe_cpu_budget_s = 0.0
+        sel_zero_b = eng.select_commit(p_2jrq)
+        self.assertIn(eng.tpcds_num, sel_zero_b)
+        self.assertEqual(eng.last_probe_cpu_s, 0.0)
+        self.assertFalse(any(r.startswith("probe_") for r in eng.reasons), eng.reasons)
+
+        # Disabled toggle -> skips probing cleanly
+        eng.probe_cpu_budget_s = 45.0
+        selector.DISABLED.add("dynamic_probe")
+        sel_dis = eng.select_commit(p_2jrq)
+        self.assertIn(eng.tpcds_num, sel_dis)
+        self.assertEqual(eng.last_probe_cpu_s, 0.0)
+        self.assertFalse(any(r.startswith("probe_") for r in eng.reasons), eng.reasons)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
