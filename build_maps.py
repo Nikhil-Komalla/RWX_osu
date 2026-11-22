@@ -54,12 +54,13 @@ import pathlib
 import pickle
 import pkgutil
 import re
+import subprocess
 import sys
 import time
 import unittest
 import zlib
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 
 def _rel_path(path_obj: Any, repo: pathlib.Path) -> Optional[str]:
@@ -2518,6 +2519,279 @@ def _main_tpcds_probe_only() -> None:
     )
 
 
+_FAST_PROBE_DISCOVERY_SCRIPT = r"""
+import concurrent.futures, hashlib, importlib, io, json, subprocess, sys, tempfile, types, unittest
+from collections import defaultdict
+
+payload_in = json.loads(sys.stdin.read())
+repo = payload_in["repo"]
+test_ids = payload_in["test_ids"]
+special = {
+    "tests/test_parser.py::TestParser::test_max_nodes",
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+    "tests/test_executor.py::TestExecutor::test_execute_tpch",
+    "tests/test_generator.py::TestGenerator::test_generator_memory",
+} | set(payload_in.get("subprocess_test_ids", ()))
+
+class _MissingDepError(RuntimeError):
+    pass
+
+class _MissingStubObj:
+    def __init__(self, name):
+        self._name = name
+    def __getattr__(self, attr):
+        if attr.startswith("__") and attr.endswith("__"):
+            raise AttributeError(attr)
+        return _MissingStubObj(f"{self._name}.{attr}")
+    def __call__(self, *a, **kw):
+        raise _MissingDepError(f"missing dep called: {self._name}")
+    def __enter__(self):
+        raise _MissingDepError(f"missing dep enter: {self._name}")
+    def __exit__(self, *a):
+        return False
+    def __iter__(self):
+        raise _MissingDepError(f"missing dep iter: {self._name}")
+    def __bool__(self):
+        raise _MissingDepError(f"missing dep bool: {self._name}")
+    def __getitem__(self, key):
+        raise _MissingDepError(f"missing dep getitem: {self._name}")
+
+for root_mod in ("duckdb", "numpy", "pandas", "pandas.testing", "pytz", "dateutil", "dateutil.relativedelta"):
+    for existing in [k for k in list(sys.modules) if k == root_mod or k.startswith(root_mod + ".")]:
+        del sys.modules[existing]
+    m = types.ModuleType(root_mod)
+    m.__path__ = []
+    m.__getattr__ = lambda attr, _r=root_mod: (_ for _ in ()).throw(AttributeError(attr)) if (attr.startswith("__") and attr.endswith("__")) else _MissingStubObj(f"{_r}.{attr}")
+    sys.modules[root_mod] = m
+sys.modules["dateutil"].relativedelta = sys.modules["dateutil.relativedelta"]
+
+for tf_attr in ("TemporaryDirectory", "NamedTemporaryFile", "TemporaryFile", "SpooledTemporaryFile", "mkstemp", "mkdtemp"):
+    if hasattr(tempfile, tf_attr):
+        setattr(tempfile, tf_attr, _MissingStubObj(f"tempfile.{tf_attr}"))
+for sp_attr in ("Popen", "run", "call", "check_call", "check_output"):
+    if hasattr(subprocess, sp_attr):
+        setattr(subprocess, sp_attr, _MissingStubObj(f"subprocess.{sp_attr}"))
+
+class _SyncPoolExecutor(concurrent.futures.Executor):
+    def submit(self, fn, /, *args, **kwargs):
+        fut = concurrent.futures.Future()
+        try:
+            fut.set_result(fn(*args, **kwargs))
+        except BaseException as exc:
+            fut.set_exception(exc)
+        return fut
+    def shutdown(self, wait=True, *, cancel_futures=False):
+        pass
+
+class _DFToken:
+    __slots__ = ("sql_s",)
+    def __init__(self, sql_s):
+        self.sql_s = sql_s
+
+class _ConnRecorder:
+    def __init__(self):
+        self.calls = []
+        self.digests = []
+    def execute(self, sql_s, *args, **kwargs):
+        if args or kwargs or not isinstance(sql_s, str):
+            raise _MissingDepError("conn.execute args")
+        self.calls.append(sql_s)
+        tok = _DFToken(sql_s)
+        return types.SimpleNamespace(df=lambda: tok)
+    def verify_pair(self, a, b, **kw):
+        if kw or not isinstance(a, _DFToken) or not isinstance(b, _DFToken):
+            raise _MissingDepError("assert_frame_equal args")
+        self.digests.append(hashlib.sha256((a.sql_s + "\0" + b.sql_s).encode("utf-8")).hexdigest()[:16])
+
+class _StrictTestResult(unittest.TestResult):
+    def __init__(self):
+        super().__init__()
+        self.any_bad = False
+    def addError(self, test, err):
+        self.any_bad = True
+        super().addError(test, err)
+    def addFailure(self, test, err):
+        self.any_bad = True
+        super().addFailure(test, err)
+    def addSkip(self, test, reason):
+        self.any_bad = True
+        super().addSkip(test, reason)
+    def addExpectedFailure(self, test, err):
+        self.any_bad = True
+        super().addExpectedFailure(test, err)
+    def addUnexpectedSuccess(self, test):
+        self.any_bad = True
+        super().addUnexpectedSuccess(test)
+    def addSubTest(self, test, subtest, err):
+        if err is not None:
+            self.any_bad = True
+        super().addSubTest(test, subtest, err)
+
+sys.path.insert(0, repo)
+by_cls = defaultdict(list)
+for tid in test_ids:
+    if tid in special:
+        continue
+    parts = tid.split("::")
+    if len(parts) != 3:
+        continue
+    by_cls[(parts[0], parts[1])].append((tid, parts[2]))
+
+fast_unprobed = []
+opt_conn_digests = {}
+orig_out, orig_err = sys.stdout, sys.stderr
+sys.stdout = io.StringIO()
+sys.stderr = io.StringIO()
+try:
+    for (tfile, cls_name), items in sorted(by_cls.items()):
+        try:
+            mod = importlib.import_module(tfile[:-3].replace("/", "."))
+            cls = getattr(mod, cls_name)
+        except BaseException:
+            fast_unprobed.extend(tid for tid, _ in items)
+            continue
+        if getattr(cls, "__unittest_skip__", False):
+            fast_unprobed.extend(tid for tid, _ in items)
+            continue
+        is_opt = (tfile == "tests/test_optimizer.py" and cls_name == "TestOptimizer")
+        is_exec = (tfile == "tests/test_executor.py" and cls_name == "TestExecutor")
+        orig_schema = None
+        orig_afe = None
+        try:
+            if is_opt:
+                import sqlglot
+                from sqlglot.schema import MappingSchema
+                orig_schema = getattr(sqlglot, "schema", None)
+                sqlglot.schema = MappingSchema()
+                cls.pool = _SyncPoolExecutor()
+                orig_afe = getattr(mod, "assert_frame_equal", None)
+            elif is_exec:
+                cls.tpch_conn = _MissingStubObj("TestExecutor.tpch_conn")
+                cls.tpcds_conn = _MissingStubObj("TestExecutor.tpcds_conn")
+                cls.tpch_tables = _MissingStubObj("TestExecutor.tpch_tables")
+                cls.tpcds_tables = _MissingStubObj("TestExecutor.tpcds_tables")
+            else:
+                cls.setUpClass()
+        except BaseException:
+            fast_unprobed.extend(tid for tid, _ in items)
+            continue
+
+        try:
+            for tid, meth_name in items:
+                try:
+                    tc = cls(meth_name)
+                    if getattr(tc, "__unittest_skip__", False) or getattr(getattr(cls, meth_name, None), "__unittest_skip__", False):
+                        fast_unprobed.append(tid)
+                        continue
+                    rec = None
+                    if is_opt:
+                        rec = _ConnRecorder()
+                        cls.conn = rec
+                        mod.assert_frame_equal = rec.verify_pair
+                    res = _StrictTestResult()
+                    tc.run(res)
+                    ok = (
+                        res.testsRun == 1
+                        and not res.any_bad
+                        and not res.failures
+                        and not res.errors
+                        and not res.skipped
+                        and res.wasSuccessful()
+                    )
+                    if ok and rec is not None:
+                        ok = len(rec.calls) == 2 * len(rec.digests)
+                    if ok:
+                        if rec is not None and rec.digests:
+                            opt_conn_digests[tid] = rec.digests
+                    else:
+                        fast_unprobed.append(tid)
+                except BaseException:
+                    fast_unprobed.append(tid)
+        finally:
+            if is_opt:
+                try:
+                    import sqlglot
+                    sqlglot.schema = orig_schema
+                    if orig_afe is not None:
+                        mod.assert_frame_equal = orig_afe
+                except BaseException:
+                    pass
+            elif not is_exec:
+                try:
+                    cls.tearDownClass()
+                except BaseException:
+                    pass
+                try:
+                    cls.doClassCleanups()
+                except BaseException:
+                    pass
+finally:
+    sys.stdout, sys.stderr = orig_out, orig_err
+
+sys.stdout.write(json.dumps({
+    "fast_unprobed_ids": sorted(set(fast_unprobed)),
+    "opt_conn_digests": opt_conn_digests,
+}))
+sys.stdout.flush()
+"""
+
+
+def run_fast_probe_maps(
+    repo: pathlib.Path,
+    test_ids: List[str],
+    subprocess_test_ids: Sequence[str],
+) -> Dict[str, Any]:
+    t0 = time.perf_counter()
+    py_exec = "/usr/bin/python3" if pathlib.Path("/usr/bin/python3").exists() else sys.executable
+    sub_env = {"HOME": "/tmp", "PATH": "/usr/bin:/bin", "SKIP_INTEGRATION": "0"}
+    proc = subprocess.run(
+        [py_exec, "-B", "-c", _FAST_PROBE_DISCOVERY_SCRIPT],
+        input=json.dumps({
+            "repo": str(repo),
+            "test_ids": list(test_ids),
+            "subprocess_test_ids": list(subprocess_test_ids),
+        }),
+        text=True,
+        capture_output=True,
+        env=sub_env,
+        cwd=str(repo),
+        check=True,
+    )
+    data = json.loads(proc.stdout)
+    fast_unprobed_ids = frozenset(data["fast_unprobed_ids"])
+    opt_conn_digests = {str(k): tuple(v) for k, v in data["opt_conn_digests"].items()}
+    elapsed = time.perf_counter() - t0
+    print(
+        f"[Pass 8 fast_probe] py={py_exec} unprobed={len(fast_unprobed_ids)} "
+        f"opt_conn={len(opt_conn_digests)} ({sum(len(v) for v in opt_conn_digests.values())} pairs) "
+        f"in {elapsed:.1f}s",
+        file=sys.stderr,
+        flush=True,
+    )
+    return {
+        "fast_unprobed_ids": fast_unprobed_ids,
+        "opt_conn_digests": opt_conn_digests,
+    }
+
+
+def _main_fast_probe_only() -> None:
+    repo = pathlib.Path(sys.argv[2]).resolve()
+    maps_path = pathlib.Path(sys.argv[3]).resolve()
+    os.chdir(repo)
+    payload = pickle.loads(zlib.decompress(maps_path.read_bytes()))
+    payload.update(run_fast_probe_maps(repo, payload["test_ids"], payload.get("subprocess_test_ids", ())))
+    payload["version"] = max(int(payload.get("version", 8)), 9)
+    raw_bytes = pickle.dumps(payload, protocol=5)
+    comp_bytes = zlib.compress(raw_bytes, level=9)
+    assert len(comp_bytes) < 2 * 1024 * 1024, f"Map too large: {len(comp_bytes)} bytes"
+    maps_path.write_bytes(comp_bytes)
+    print(
+        f"[DONE] Augmented fast_probe maps in {maps_path} ({len(comp_bytes) / 1024:.1f} KiB compressed, {len(raw_bytes) / 1024:.1f} KiB raw)",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _augment_main() -> None:
     """Add/refresh static + probe-derived keys on an existing maps file without re-running pass 1/2."""
     repo = pathlib.Path(sys.argv[2]).resolve()
@@ -2560,7 +2834,8 @@ def _augment_main() -> None:
     print(f"[Pass 6] subprocess_test_ids: {payload['subprocess_test_ids']}", file=sys.stderr, flush=True)
     os.chdir(repo)
     payload.update(run_tpcds_probe_maps(repo, payload["test_ids"], payload["line_cov"]))
-    payload["version"] = max(int(payload.get("version", 7)), 8)
+    payload.update(run_fast_probe_maps(repo, payload["test_ids"], payload.get("subprocess_test_ids", ())))
+    payload["version"] = max(int(payload.get("version", 8)), 9)
     raw_bytes = pickle.dumps(payload, protocol=5)
     comp_bytes = zlib.compress(raw_bytes, level=9)
     maps_path.write_bytes(comp_bytes)
@@ -2681,7 +2956,8 @@ def main() -> None:
     payload["eq_safe_sites"] = _site_dict_to_frozensets(eq_res.get("safe_sites", {}))
     payload["eq_sites_stats"] = eq_res.get("stats", {})
     payload.update(run_tpcds_probe_maps(repo, test_ids, line_cov))
-    payload["version"] = 8
+    payload.update(run_fast_probe_maps(repo, test_ids, payload.get("subprocess_test_ids", ())))
+    payload["version"] = 9
     raw_bytes = pickle.dumps(payload, protocol=5)
     comp_bytes = zlib.compress(raw_bytes, level=9)
     out_path.write_bytes(comp_bytes)
@@ -2738,5 +3014,7 @@ if __name__ == "__main__":
         _augment_main()
     elif len(sys.argv) >= 2 and sys.argv[1] == "--tpcds-probe-only":
         _main_tpcds_probe_only()
+    elif len(sys.argv) >= 2 and sys.argv[1] == "--fast-probe-only":
+        _main_fast_probe_only()
     else:
         main()

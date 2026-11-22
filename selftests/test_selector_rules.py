@@ -1490,6 +1490,8 @@ class SelectorUnitTests(unittest.TestCase):
         import difflib
 
         eng = self._make_real_engine()
+        eng.max_s3_exec_qids = 57
+        eng._s3_budget_env = 25.0
         base = RWX_DIR / "_sqlglot_baseline"
         tpcds_num = eng.tpcds_num
         self.assertIsNotNone(tpcds_num)
@@ -1771,7 +1773,15 @@ class SelectorUnitTests(unittest.TestCase):
             "        if not table_alias:\n            if False:\n                _zz_s3p = 1\n            return []\n",
             1,
         )
-        sel_c = eng.select_commit(_make_patch(c_rel, c_src, c_new))
+        orig_cap = eng.max_s3_exec_qids
+        orig_s3b = eng._s3_budget_env
+        eng.max_s3_exec_qids = 57
+        eng._s3_budget_env = 25.0
+        try:
+            sel_c = eng.select_commit(_make_patch(c_rel, c_src, c_new))
+        finally:
+            eng.max_s3_exec_qids = orig_cap
+            eng._s3_budget_env = orig_s3b
         self.assertNotIn(tpcds_num, sel_c)
         self.assertTrue(any(r.startswith("probe_drop:tpcds:s3(31):") for r in eng.reasons), eng.reasons)
 
@@ -1803,6 +1813,135 @@ class SelectorUnitTests(unittest.TestCase):
         sel_d_leak = eng.select_commit(_make_patch(d_rel, d_src, d_leak))
         self.assertIn(gm_num, sel_d_leak)
         self.assertIn("probe_keep:gen_mem", eng.reasons)
+
+    def test_v11_fast_test_oracle_and_priority_caps(self) -> None:
+        import difflib
+        import importlib
+
+        eng = self._make_real_engine()
+        base = RWX_DIR / "_sqlglot_baseline"
+        selector.TRACE = True
+
+        # 1) Passing 0-fail sample commits drop to 0 tests (including TestOptimizer::test_optimize via opt_conn_digests!)
+        for cid in ("2qn5", "5y72", "8y7j", "fryt", "ktz3"):
+            patch_txt = (RWX_DIR / f"sample/commits/{cid}.patch").read_text("utf-8")
+            chosen = eng.select_commit(patch_txt)
+            self.assertEqual(chosen, set(), f"{cid}: expected empty selection, got {chosen}, reasons={eng.reasons}")
+            self.assertTrue(any(r.startswith("probe_drop:fast:") for r in eng.reasons), (cid, eng.reasons))
+
+        # 2) Failing partial sample commit 6ze8 keeps the failing test (& fast fail-fast stops importing extra micro-tests)
+        p_6ze8 = (RWX_DIR / "sample/commits/6ze8.patch").read_text("utf-8")
+        sel_6ze8 = eng.select_commit(p_6ze8)
+        regexp_split_num = eng.id_to_num["tests/dialects/test_dremio.py::TestDremio::test_regexp_split"]
+        self.assertIn(regexp_split_num, sel_6ze8, eng.reasons)
+        self.assertTrue(any(r.startswith(("probe_drop:fast:", "probe_keep:fast:")) for r in eng.reasons), eng.reasons)
+
+        # 3) Direct _probe_fast_tests check inside a forked overlay child:
+        #    setUpClass runs once, failing assertion / SkipTest / _MissingDepError / broken import module all KEPT!
+        fake_tests_json = {
+            "tests": [
+                {"number": 0, "id": "tests/test_zz_v11_unit.py::TestZZ::test_pass_a", "file": "tests/test_zz_v11_unit.py", "seconds": 0.50},
+                {"number": 1, "id": "tests/test_zz_v11_unit.py::TestZZ::test_pass_b", "file": "tests/test_zz_v11_unit.py", "seconds": 0.50},
+                {"number": 2, "id": "tests/test_zz_v11_unit.py::TestZZ::test_fail", "file": "tests/test_zz_v11_unit.py", "seconds": 0.50},
+                {"number": 3, "id": "tests/test_zz_v11_unit.py::TestZZ::test_skip", "file": "tests/test_zz_v11_unit.py", "seconds": 0.50},
+                {"number": 4, "id": "tests/test_zz_v11_unit.py::TestZZ::test_missing_dep", "file": "tests/test_zz_v11_unit.py", "seconds": 0.50},
+                {"number": 5, "id": "tests/test_zz_v11_broken.py::TestBroken::test_never_pass", "file": "tests/test_zz_v11_broken.py", "seconds": 0.50},
+            ],
+        }
+        fake_maps = {
+            "version": 9,
+            "test_ids": [t["id"] for t in fake_tests_json["tests"]],
+            "line_cov": {},
+        }
+        fake_eng = selector.SelectorEngine(fake_tests_json, fake_maps, base)
+        unit_src = (
+            b"import unittest, pytz\n"
+            b"class TestZZ(unittest.TestCase):\n"
+            b"    setup_calls = 0\n"
+            b"    @classmethod\n"
+            b"    def setUpClass(cls):\n"
+            b"        cls.setup_calls += 1\n"
+            b"    def test_pass_a(self):\n"
+            b"        self.assertEqual(self.setup_calls, 1)\n"
+            b"    def test_pass_b(self):\n"
+            b"        self.assertEqual(self.setup_calls, 1)\n"
+            b"    def test_fail(self):\n"
+            b"        self.assertEqual(1, 2)\n"
+            b"    def test_skip(self):\n"
+            b"        self.skipTest('skip must keep')\n"
+            b"    def test_missing_dep(self):\n"
+            b"        pytz.timezone('UTC')\n"
+        )
+        broken_src = b"raise ImportError('broken test module')\n"
+        import os as _os
+        import json as _json
+        import sys as _sys
+
+        r_fd, w_fd = _os.pipe()
+        pid = _os.fork()
+        if pid == 0:
+            _os.close(r_fd)
+            try:
+                src_str = str(base)
+                if src_str not in _sys.path:
+                    _sys.path.insert(0, src_str)
+                _sys.meta_path.insert(
+                    0,
+                    selector.PatchOverlayFinder(
+                        base,
+                        {"tests/test_zz_v11_unit.py": unit_src, "tests/test_zz_v11_broken.py": broken_src},
+                        set(),
+                    ),
+                )
+                selector._install_fast_probe_sandbox()
+                passed_nums = fake_eng._probe_fast_tests([0, 1, 2, 3, 4, 5], set(), False)
+                mod_zz = importlib.import_module("tests.test_zz_v11_unit")
+                _os.write(w_fd, _json.dumps({"passed": passed_nums, "setup_calls": mod_zz.TestZZ.setup_calls}).encode("ascii"))
+            finally:
+                _os.close(w_fd)
+                _os._exit(0)
+        _os.close(w_fd)
+        raw = b""
+        while True:
+            chunk = _os.read(r_fd, 4096)
+            if not chunk:
+                break
+            raw += chunk
+        _os.close(r_fd)
+        _os.waitpid(pid, 0)
+        child_res = _json.loads(raw.decode("ascii"))
+        self.assertEqual(child_res["setup_calls"], 1)
+        self.assertEqual(sorted(child_res["passed"]), [0, 1])
+
+        # 4) Stage-3 max_s3_exec_qids <= 20 cap & separate P1 (30s) / P2 (15s) budgets
+        def _make_patch(rel: str, old_s: str, new_s: str) -> str:
+            return (
+                f"diff --git a/{rel} b/{rel}\nindex 0000000..1111111 100644\n"
+                + "".join(difflib.unified_diff(old_s.splitlines(True), new_s.splitlines(True), f"a/{rel}", f"b/{rel}", n=3))
+            )
+
+        c_rel = "sqlglot/expressions/core.py"
+        c_src = (base / c_rel).read_text("utf-8")
+        c_new = c_src.replace(
+            "        if not table_alias:\n            return []\n",
+            "        if not table_alias:\n            if False:\n                _zz_cap = 1\n            return []\n",
+            1,
+        )
+        eng2 = self._make_real_engine()
+        self.assertEqual(eng2.max_s3_exec_qids, 20)
+        sel_cap = eng2.select_commit(_make_patch(c_rel, c_src, c_new))
+        self.assertIn(eng2.tpcds_num, sel_cap)
+        self.assertEqual(eng2.last_probe_cpu_s, 0.0)
+        self.assertFalse(any(r.startswith("probe_drop:tpcds:") for r in eng2.reasons), eng2.reasons)
+
+        # Exhaust P2 (15s) while P1 remains available -> P1 fast probes still run & drop!
+        eng2.s3_probe_cpu_s = 15.0
+        eng2.fast_probe_cpu_s = 0.0
+        eng2.total_probe_cpu_s = 15.0
+        p_2qn5 = (RWX_DIR / "sample/commits/2qn5.patch").read_text("utf-8")
+        sel_p1 = eng2.select_commit(p_2qn5)
+        self.assertEqual(sel_p1, set(), eng2.reasons)
+        self.assertTrue(any(r.startswith("probe_drop:fast:") for r in eng2.reasons), eng2.reasons)
 
 
 if __name__ == "__main__":

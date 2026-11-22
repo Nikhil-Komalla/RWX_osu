@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import concurrent.futures
 import copy
 import csv
 import difflib
@@ -11,9 +12,11 @@ import enum
 import gc
 import gzip
 import hashlib
+import importlib
 import importlib.abc
 import importlib.machinery
 import json
+import logging
 import math
 import os
 import pickle
@@ -21,8 +24,12 @@ import re
 import resource
 import select
 import signal
+import subprocess
 import sys
+import tempfile
 import time
+import types
+import unittest
 import zlib
 
 sys.dont_write_bytecode = True
@@ -61,27 +68,40 @@ def _total_cpu_seconds() -> float:
 
 
 class _MemSourceLoader(importlib.machinery.SourceFileLoader):
-    def __init__(self, fullname: str, path: str, data: bytes) -> None:
+    def __init__(self, fullname: str, path: str, data: Optional[bytes], code_obj: Optional[Any] = None) -> None:
         super().__init__(fullname, path)
         self._data = data
+        self._code_obj = code_obj
 
     def path_stats(self, path: str) -> Any:
         # Force in-memory source execution without reading or writing stale .pyc files.
         raise OSError("in-memory")
 
     def get_data(self, path: str) -> bytes:
-        if path == self.path:
+        if path == self.path and self._data is not None:
             return self._data
         return super().get_data(path)
+
+    def get_code(self, fullname: str) -> Any:
+        if self._code_obj is not None:
+            return self._code_obj
+        return super().get_code(fullname)
 
 
 class PatchOverlayFinder(importlib.abc.MetaPathFinder):
     """In-memory overlay MetaPathFinder for patched/added/deleted sqlglot & test modules."""
 
-    def __init__(self, base_dir: Path, patched_files: Dict[str, bytes], deleted_files: Set[str]) -> None:
+    def __init__(
+        self,
+        base_dir: Path,
+        patched_files: Dict[str, bytes],
+        deleted_files: Set[str],
+        code_cache: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self.base_dir = base_dir
         self.patched_files = patched_files
         self.deleted_files = deleted_files
+        self.code_cache = code_cache
 
     def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
         if not (
@@ -99,10 +119,149 @@ class PatchOverlayFinder(importlib.abc.MetaPathFinder):
                 vpath = str(self.base_dir / rel)
                 loader = _MemSourceLoader(fullname, vpath, self.patched_files[rel])
                 spec = importlib.machinery.ModuleSpec(fullname, loader, origin=vpath, is_package=is_pkg)
+                spec.has_location = True
+                if is_pkg:
+                    spec.submodule_search_locations = [str((self.base_dir / rel).parent)]
+                return spec
+            if self.code_cache and rel in self.code_cache:
+                vpath = str(self.base_dir / rel)
+                loader = _MemSourceLoader(fullname, vpath, None, self.code_cache[rel])
+                spec = importlib.machinery.ModuleSpec(fullname, loader, origin=vpath, is_package=is_pkg)
+                spec.has_location = True
                 if is_pkg:
                     spec.submodule_search_locations = [str((self.base_dir / rel).parent)]
                 return spec
         return None
+
+
+class _MissingDepError(RuntimeError):
+    """Raised inside forked fast-probe child when a test exercises an unavailable third-party dep or disk/subprocess API."""
+
+
+class _MissingStubObj:
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __getattr__(self, attr: str) -> Any:
+        if attr.startswith("__") and attr.endswith("__"):
+            raise AttributeError(attr)
+        return _MissingStubObj(f"{self._name}.{attr}")
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        raise _MissingDepError(f"missing dep called: {self._name}")
+
+    def __enter__(self) -> Any:
+        raise _MissingDepError(f"missing dep enter: {self._name}")
+
+    def __exit__(self, *args: Any) -> bool:
+        return False
+
+    def __iter__(self) -> Any:
+        raise _MissingDepError(f"missing dep iter: {self._name}")
+
+    def __bool__(self) -> bool:
+        raise _MissingDepError(f"missing dep bool: {self._name}")
+
+    def __getitem__(self, key: Any) -> Any:
+        raise _MissingDepError(f"missing dep getitem: {self._name}")
+
+
+class _SyncPoolExecutor(concurrent.futures.Executor):
+    def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+        fut: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        try:
+            fut.set_result(fn(*args, **kwargs))
+        except BaseException as exc:
+            fut.set_exception(exc)
+        return fut
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        return None
+
+
+class _DFToken:
+    __slots__ = ("sql_s",)
+
+    def __init__(self, sql_s: str) -> None:
+        self.sql_s = sql_s
+
+
+class _ConnVerifier:
+    def __init__(self, expected_digests: Tuple[str, ...]) -> None:
+        self.total_expected = len(expected_digests)
+        self.remaining: Counter[str] = Counter(expected_digests)
+        self.calls: List[str] = []
+        self.matched = 0
+
+    def execute(self, sql_s: Any, *args: Any, **kwargs: Any) -> Any:
+        if args or kwargs or not isinstance(sql_s, str):
+            raise _MissingDepError("conn.execute unsupported args")
+        self.calls.append(sql_s)
+        tok = _DFToken(sql_s)
+        return types.SimpleNamespace(df=lambda: tok)
+
+    def verify_pair(self, a: Any, b: Any, **kw: Any) -> None:
+        if kw or not isinstance(a, _DFToken) or not isinstance(b, _DFToken):
+            raise _MissingDepError("assert_frame_equal unsupported args")
+        dig = hashlib.sha256((a.sql_s + "\0" + b.sql_s).encode("utf-8")).hexdigest()[:16]
+        if self.remaining.get(dig, 0) <= 0:
+            raise _MissingDepError("duckdb sql diverged from baseline")
+        self.remaining[dig] -= 1
+        self.matched += 1
+
+
+class _StrictTestResult(unittest.TestResult):
+    def __init__(self) -> None:
+        super().__init__()
+        self.any_bad = False
+
+    def addError(self, test: Any, err: Any) -> None:
+        self.any_bad = True
+        super().addError(test, err)
+
+    def addFailure(self, test: Any, err: Any) -> None:
+        self.any_bad = True
+        super().addFailure(test, err)
+
+    def addSkip(self, test: Any, reason: str) -> None:
+        self.any_bad = True
+        super().addSkip(test, reason)
+
+    def addExpectedFailure(self, test: Any, err: Any) -> None:
+        self.any_bad = True
+        super().addExpectedFailure(test, err)
+
+    def addUnexpectedSuccess(self, test: Any) -> None:
+        self.any_bad = True
+        super().addUnexpectedSuccess(test)
+
+    def addSubTest(self, test: Any, subtest: Any, err: Any) -> None:
+        if err is not None:
+            self.any_bad = True
+        super().addSubTest(test, subtest, err)
+
+
+def _install_fast_probe_sandbox() -> None:
+    """Install deterministic stubs for optional/disk/subprocess deps inside forked fast-probe child."""
+    for root_mod in ("duckdb", "numpy", "pandas", "pandas.testing", "pytz", "dateutil", "dateutil.relativedelta"):
+        for existing in [k for k in list(sys.modules) if k == root_mod or k.startswith(root_mod + ".")]:
+            del sys.modules[existing]
+        m = types.ModuleType(root_mod)
+        m.__path__ = []
+        m.__getattr__ = lambda attr, _r=root_mod: (  # type: ignore[method-assign]
+            (_ for _ in ()).throw(AttributeError(attr))
+            if (attr.startswith("__") and attr.endswith("__"))
+            else _MissingStubObj(f"{_r}.{attr}")
+        )
+        sys.modules[root_mod] = m
+    sys.modules["dateutil"].relativedelta = sys.modules["dateutil.relativedelta"]  # type: ignore[attr-defined]
+    for tf_attr in ("TemporaryDirectory", "NamedTemporaryFile", "TemporaryFile", "SpooledTemporaryFile", "mkstemp", "mkdtemp"):
+        if hasattr(tempfile, tf_attr):
+            setattr(tempfile, tf_attr, _MissingStubObj(f"tempfile.{tf_attr}"))
+    for sp_attr in ("Popen", "run", "call", "check_call", "check_output"):
+        if hasattr(subprocess, sp_attr):
+            setattr(subprocess, sp_attr, _MissingStubObj(f"subprocess.{sp_attr}"))
+
 
 DATA_DIR = Path(os.environ.get("BLAST_DATA_DIR", "/data"))
 DEFAULT_SRC = Path(__file__).resolve().parent / "sqlglot_src"
@@ -1482,6 +1641,8 @@ class SelectorEngine:
         tests = tests_json["tests"]
 
         self.id_to_num: Dict[str, int] = {}
+        self.num_to_id: List[str] = [""] * len(tests)
+        self.num_to_parts: List[Optional[Tuple[str, str, str]]] = [None] * len(tests)
         self.num_to_ms: List[int] = [0] * len(tests)
         self.file_to_nums: Dict[str, List[int]] = defaultdict(list)
         self.class_to_nums: Dict[Tuple[str, str], List[int]] = defaultdict(list)
@@ -1500,6 +1661,7 @@ class SelectorEngine:
             ms = math.floor(float(t["seconds"]) * 1000.0 + 0.5)
             bit = 1 << num
             self.id_to_num[tid] = num
+            self.num_to_id[num] = tid
             self.num_to_ms[num] = ms
             self.file_to_nums[tfile].append(num)
             self.file_to_livemask[tfile] |= bit
@@ -1507,6 +1669,7 @@ class SelectorEngine:
             self.all_livemask |= bit
             parts = tid.split("::")
             if len(parts) == 3:
+                self.num_to_parts[num] = (tfile, parts[1], parts[2])
                 self.class_to_nums[(tfile, parts[1])].append(num)
                 self.class_to_livemask[(tfile, parts[1])] |= bit
                 self.method_to_num[(tfile, parts[1], parts[2])] = num
@@ -1598,11 +1761,41 @@ class SelectorEngine:
         }
         self.tpch_digests: Tuple[str, ...] = tuple(maps.get("tpch_digests", ()))
         self.max_nodes_files: FrozenSet[str] = frozenset(maps.get("max_nodes_files", ()))
+        raw_opt_conn = maps.get("opt_conn_digests", {})
+        self.opt_conn_digests_by_num: Dict[int, Tuple[str, ...]] = {
+            self.id_to_num[tid]: tuple(digs) for tid, digs in raw_opt_conn.items() if tid in self.id_to_num
+        }
+        fast_unprobed: Set[int] = (
+            {x for x in (self.max_nodes_num, self.tpcds_num, self.tpch_num, self.gen_mem_num) if x is not None}
+            | {self.id_to_num[tid] for tid in self.subprocess_test_ids if tid in self.id_to_num}
+            | {self.id_to_num[tid] for tid in maps.get("fast_unprobed_ids", ()) if tid in self.id_to_num}
+            | {num for num in self.all_nums if self.num_to_parts[num] is None or self.num_to_ms[num] > 2500}
+        )
+        self._fast_unprobed_nums: FrozenSet[int] = frozenset(fast_unprobed)
+        walker_bmask = 0
+        for raw in self.raw_pkg_walkers.values():
+            walker_bmask |= self._to_mask(raw)
+        for raw in self.raw_dir_access.values():
+            walker_bmask |= self._to_mask(raw)
+        self._pkg_dir_walker_nums: FrozenSet[int] = frozenset(self._decode_masks(walker_bmask, 0))
         self.probe_cpu_budget_s: float = float(os.environ.get("BLAST_PROBE_BUDGET_S", "45.0"))
+        self._fast_budget_env: Optional[float] = (
+            float(os.environ["BLAST_FAST_BUDGET_S"]) if "BLAST_FAST_BUDGET_S" in os.environ else None
+        )
+        self._s3_budget_env: Optional[float] = (
+            float(os.environ["BLAST_S3_BUDGET_S"]) if "BLAST_S3_BUDGET_S" in os.environ else None
+        )
+        self.max_s3_exec_qids: int = int(os.environ.get("BLAST_MAX_S3_QIDS", "20"))
         self.total_probe_cpu_s: float = 0.0
+        self.fast_probe_cpu_s: float = 0.0
+        self.s3_probe_cpu_s: float = 0.0
         self.last_probe_cpu_s: float = 0.0
         self._tpcds_schema_cache: Optional[Dict[str, Dict[str, str]]] = None
         self._raw_tpcds_tables: Optional[Dict[str, Tuple[Dict[str, str], List[tuple]]]] = None
+        self._tpcds_table_cache: Dict[str, Tuple[Dict[str, str], List[tuple]]] = {}
+        self._prewarm_mods: Optional[FrozenSet[str]] = None
+        self._prewarm_dialects: Dict[str, Any] = {}
+        self._code_cache: Dict[str, Any] = {}
         self._tpcds_sqls_cache: Optional[List[Tuple[bool, str]]] = None
         self._tpch_sqls_cache: Optional[List[str]] = None
         self._tpcds_cov_qmask: int = 0
@@ -3624,34 +3817,65 @@ class SelectorEngine:
             ]
         return self._tpch_sqls_cache
 
+    def _read_tpcds_table_csv(self, table: str, columns: Dict[str, str]) -> Tuple[Dict[str, str], List[tuple]]:
+        dir_tpcds = self.src_root / "tests/fixtures/optimizer/tpc-ds"
+        fn = dir_tpcds / f"{table}.csv.gz"
+        with open(fn, "rb") as fb:
+            is_gz = fb.read(2) == b"\x1f\x8b"
+        opener = gzip.open(fn, "rt", newline="") if is_gz else open(fn, encoding="utf-8", newline="")
+        with opener as f:
+            reader = csv.reader(f, delimiter="|")
+            rows: List[tuple] = []
+            ctypes: List[Any] = []
+            next(reader)
+            for row in reader:
+                if not ctypes:
+                    for v in row:
+                        try:
+                            ctypes.append(type(ast.literal_eval(v)))
+                        except (ValueError, SyntaxError):
+                            ctypes.append(str)
+                rows.append(
+                    tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row))
+                )
+            return columns, rows
+
     def _ensure_raw_tpcds_tables(self) -> Dict[str, Tuple[Dict[str, str], List[tuple]]]:
         if self._raw_tpcds_tables is None:
             schema = self._load_tpcds_schema()
-            dir_tpcds = self.src_root / "tests/fixtures/optimizer/tpc-ds"
             raw_tables: Dict[str, Tuple[Dict[str, str], List[tuple]]] = {}
             for table, columns in schema.items():
-                fn = dir_tpcds / f"{table}.csv.gz"
-                with open(fn, "rb") as fb:
-                    is_gz = fb.read(2) == b"\x1f\x8b"
-                opener = gzip.open(fn, "rt", newline="") if is_gz else open(fn, encoding="utf-8", newline="")
-                with opener as f:
-                    reader = csv.reader(f, delimiter="|")
-                    rows: List[tuple] = []
-                    ctypes: List[Any] = []
-                    next(reader)
-                    for row in reader:
-                        if not ctypes:
-                            for v in row:
-                                try:
-                                    ctypes.append(type(ast.literal_eval(v)))
-                                except (ValueError, SyntaxError):
-                                    ctypes.append(str)
-                        rows.append(
-                            tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row))
-                        )
-                    raw_tables[table] = (columns, rows)
+                cached = self._tpcds_table_cache.get(table)
+                if cached is None:
+                    cached = self._read_tpcds_table_csv(table, columns)
+                    self._tpcds_table_cache[table] = cached
+                raw_tables[table] = cached
             self._raw_tpcds_tables = raw_tables
         return self._raw_tpcds_tables
+
+    def _load_single_tpcds_table(self, table: str) -> Tuple[Dict[str, str], List[tuple]]:
+        cached = self._tpcds_table_cache.get(table)
+        if cached is not None:
+            return cached
+        if self._raw_tpcds_tables is not None and table in self._raw_tpcds_tables:
+            res = self._raw_tpcds_tables[table]
+            self._tpcds_table_cache[table] = res
+            return res
+        schema = self._load_tpcds_schema()
+        res = self._read_tpcds_table_csv(table, schema[table])
+        self._tpcds_table_cache[table] = res
+        return res
+
+    def _preload_tpcds_tables_for_qids(
+        self, qids: Sequence[int]
+    ) -> Dict[str, Tuple[Dict[str, str], List[tuple]]]:
+        schema = self._load_tpcds_schema()
+        tpcds_sqls = self._get_tpcds_sqls()
+        sql_blob = "\n".join(tpcds_sqls[qi][1] for qi in qids if 0 <= qi < len(tpcds_sqls)).lower()
+        for tname in schema:
+            if tname not in self._tpcds_table_cache and re.search(rf"\b{re.escape(tname.lower())}\b", sql_blob):
+                self._load_single_tpcds_table(tname)
+        return dict(self._tpcds_table_cache)
 
     def _tpcds_is_line_mode(self) -> bool:
         return not (
@@ -3747,16 +3971,20 @@ class SelectorEngine:
         if Python().generator(identify=True, comments=False).generate(exp.var("scope")) != "scope":
             return False, "guard"
 
-        built_tables: Optional[Dict[str, Any]] = None
-        rt = raw_tables
+        built_tables: Dict[str, Any] = {}
+        rt = dict(raw_tables)
 
         def _exec_one(qi: int, ast_q: Any, dk_sql: str) -> bool:
-            nonlocal built_tables, rt
-            if built_tables is None:
-                if not rt:
-                    rt = self._ensure_raw_tpcds_tables()
-                built_tables = {tn: Table(columns=cols, rows=rows) for tn, (cols, rows) in rt.items()}
-            tabs = {t.name: built_tables[t.name] for t in find_tables(ast_q)}
+            tabs: Dict[str, Any] = {}
+            for t in find_tables(ast_q):
+                tname = t.name
+                if tname not in built_tables:
+                    pair = rt.get(tname)
+                    if pair is None:
+                        pair = self._load_single_tpcds_table(tname)
+                        rt[tname] = pair
+                    built_tables[tname] = Table(columns=pair[0], rows=pair[1])
+                tabs[tname] = built_tables[tname]
             tbl = execute(ast_q, schema=tpcds_schema, tables=tabs)
             c_cols = [str(c) for c in tbl.columns]
             c_rows = [[_canon_cell(x) for x in r] for r in tbl.rows]
@@ -3767,6 +3995,7 @@ class SelectorEngine:
             schema_obj: Any = None
             used_s2 = False
             used_s3 = False
+            s3_ran = 0
             try:
                 for qi, (_, sql) in enumerate(tpcds_sqls):
                     ast_q = pickle.loads(pickle.dumps(parse_one(sql)))
@@ -3783,6 +4012,9 @@ class SelectorEngine:
                         if _canon_digest([repr(opt_q), dk_sql]) == self.tpcds_opt_digests.get(qi):
                             continue
                         used_s3 = True
+                        s3_ran += 1
+                        if s3_ran > self.max_s3_exec_qids:
+                            return False, "s1->s3"
                         if not _exec_one(qi, ast_q, dk_sql):
                             return False, "s1->s3"
                 return True, ("s1->s3" if used_s3 else ("s1->s2" if used_s2 else "s1"))
@@ -3791,6 +4023,7 @@ class SelectorEngine:
 
         if not touches_exec:
             used_s3 = False
+            s3_ran = 0
             try:
                 schema_obj = ensure_schema(tpcds_schema, dialect=None)
                 for qi in b_exec_qids:
@@ -3803,6 +4036,9 @@ class SelectorEngine:
                     if _canon_digest([repr(opt_q), dk_sql]) == self.tpcds_opt_digests.get(qi):
                         continue
                     used_s3 = True
+                    s3_ran += 1
+                    if s3_ran > self.max_s3_exec_qids:
+                        return False, "s2->s3"
                     if not _exec_one(qi, ast_q, dk_sql):
                         return False, "s2->s3"
                 exec_set = set(b_exec_qids)
@@ -3819,6 +4055,7 @@ class SelectorEngine:
         s3_set = set(b_exec_qids if s3_exec_qids is None else s3_exec_qids)
         schema_obj = None
         used_s2 = False
+        s3_ran = 0
         fail_stage = f"s3({len(s3_set)})" if len(s3_set) < len(b_exec_qids) else "s3"
         try:
             for qi in b_exec_qids:
@@ -3828,6 +4065,9 @@ class SelectorEngine:
                     return False, fail_stage
                 dk_sql = transpile(sql, write="duckdb")[0]
                 if qi in s3_set:
+                    s3_ran += 1
+                    if s3_ran > self.max_s3_exec_qids:
+                        return False, ("s2+s3" if used_s2 else fail_stage)
                     if not _exec_one(qi, ast_q, dk_sql):
                         return False, ("s2+s3" if used_s2 else fail_stage)
                 else:
@@ -3839,6 +4079,9 @@ class SelectorEngine:
                     opt_q = optimize(ast_q.copy(), schema_obj, leave_tables_isolated=True, dialect=None)
                     if _canon_digest([repr(opt_q), dk_sql]) == self.tpcds_opt_digests.get(qi):
                         continue
+                    s3_ran += 1
+                    if s3_ran > self.max_s3_exec_qids:
+                        return False, "s2+s3"
                     if not _exec_one(qi, ast_q, dk_sql):
                         return False, "s2+s3"
             exec_set = set(b_exec_qids)
@@ -3852,12 +4095,178 @@ class SelectorEngine:
         except BaseException:
             return False, ("s2+s3" if used_s2 else fail_stage)
 
+    def _probe_fast_tests(
+        self,
+        fast_cands: Sequence[int],
+        touched_sqlglot: Set[str],
+        worker_already_alive: bool = False,
+    ) -> List[int]:
+        """Run fast unittest methods in-process inside forked child; return strictly passing test numbers."""
+        touched_stems = {p[:-3].rsplit("/", 1)[-1] for p in touched_sqlglot if p.endswith(".py")}
+        by_cls: Dict[Tuple[str, str], List[Tuple[int, str]]] = defaultdict(list)
+        for num in fast_cands:
+            parts = self.num_to_parts[num]
+            if parts is None:
+                continue
+            by_cls[(parts[0], parts[1])].append((num, parts[2]))
+
+        sorted_groups: List[Tuple[Tuple[str, str], List[Tuple[int, str]]]] = []
+        for cls_key, items in by_cls.items():
+            items.sort(key=lambda it: (self.num_to_ms[it[0]], it[1]))
+            sorted_groups.append((cls_key, items))
+        sorted_groups.sort(
+            key=lambda kv: (
+                0 if kv[0][0][:-3].rsplit("/", 1)[-1].removeprefix("test_") in touched_stems else 1,
+                sum(self.num_to_ms[n] for n, _ in kv[1]),
+                kv[0][0],
+                kv[0][1],
+            )
+        )
+
+        any_kept = worker_already_alive
+        passed: List[int] = []
+        for (tfile, cls_name), items in sorted_groups:
+            if any_kept and all(self.num_to_ms[n] < 400 for n, _ in items):
+                continue
+            try:
+                mod = importlib.import_module(tfile[:-3].replace("/", "."))
+                cls = getattr(mod, cls_name)
+            except BaseException:
+                any_kept = True
+                continue
+            if getattr(cls, "__unittest_skip__", False):
+                any_kept = True
+                continue
+
+            is_opt = tfile == "tests/test_optimizer.py" and cls_name == "TestOptimizer"
+            is_exec = tfile == "tests/test_executor.py" and cls_name == "TestExecutor"
+            orig_schema: Any = None
+            orig_afe: Any = None
+            try:
+                if is_opt:
+                    import sqlglot
+                    from sqlglot.schema import MappingSchema
+
+                    orig_schema = getattr(sqlglot, "schema", None)
+                    sqlglot.schema = MappingSchema()
+                    cls.pool = _SyncPoolExecutor()
+                    orig_afe = getattr(mod, "assert_frame_equal", None)
+                elif is_exec:
+                    cls.tpch_conn = _MissingStubObj("TestExecutor.tpch_conn")
+                    cls.tpcds_conn = _MissingStubObj("TestExecutor.tpcds_conn")
+                    cls.tpch_tables = _MissingStubObj("TestExecutor.tpch_tables")
+                    cls.tpcds_tables = _MissingStubObj("TestExecutor.tpcds_tables")
+                else:
+                    cls.setUpClass()
+            except BaseException:
+                any_kept = True
+                continue
+
+            try:
+                for num, meth_name in items:
+                    if any_kept and self.num_to_ms[num] < 400:
+                        continue
+                    try:
+                        tc = cls(meth_name)
+                        if getattr(tc, "__unittest_skip__", False) or getattr(
+                            getattr(cls, meth_name, None), "__unittest_skip__", False
+                        ):
+                            any_kept = True
+                            continue
+                        ver: Optional[_ConnVerifier] = None
+                        if is_opt:
+                            exp_digs = self.opt_conn_digests_by_num.get(num)
+                            if exp_digs is not None:
+                                ver = _ConnVerifier(exp_digs)
+                                cls.conn = ver
+                                mod.assert_frame_equal = ver.verify_pair
+                            else:
+                                cls.conn = _MissingStubObj("TestOptimizer.conn")
+                                mod.assert_frame_equal = _MissingStubObj("assert_frame_equal")
+                        res = _StrictTestResult()
+                        tc.run(res)
+                        ok = (
+                            res.testsRun == 1
+                            and not res.any_bad
+                            and not res.failures
+                            and not res.errors
+                            and not res.skipped
+                            and res.wasSuccessful()
+                        )
+                        if ok and ver is not None:
+                            ok = (
+                                ver.matched == ver.total_expected
+                                and len(ver.calls) == 2 * ver.total_expected
+                            )
+                        if ok:
+                            passed.append(num)
+                        else:
+                            any_kept = True
+                    except BaseException:
+                        any_kept = True
+                        continue
+            finally:
+                if is_opt:
+                    try:
+                        import sqlglot
+
+                        sqlglot.schema = orig_schema
+                        if orig_afe is not None:
+                            mod.assert_frame_equal = orig_afe
+                    except BaseException:
+                        pass
+                elif not is_exec:
+                    try:
+                        cls.tearDownClass()
+                    except BaseException:
+                        pass
+                    try:
+                        cls.doClassCleanups()
+                    except BaseException:
+                        pass
+        return passed
+
+    def _ensure_compiled_rel(self, rel: str) -> None:
+        if rel not in self._code_cache and (self.src_root / rel).is_file():
+            txt = self._read_src(rel)
+            self._code_cache[rel] = compile(txt, str(self.src_root / rel), "exec")
+
+    def _ensure_prewarmed_sqlglot(self) -> None:
+        if self._prewarm_mods is not None:
+            return
+        for m in [
+            k
+            for k in list(sys.modules)
+            if k == "sqlglot" or k == "tests" or k.startswith(("sqlglot.", "tests."))
+        ]:
+            del sys.modules[m]
+        src_str = str(self.src_root)
+        if not sys.path or sys.path[0] != src_str:
+            if src_str in sys.path:
+                sys.path.remove(src_str)
+            sys.path.insert(0, src_str)
+        lg = logging.getLogger("sqlglot")
+        prev_d = lg.disabled
+        lg.disabled = True
+        try:
+            import sqlglot  # noqa: F401
+            import tests.dialects.test_dialect  # noqa: F401
+            from sqlglot.dialects.dialect import Dialect
+        finally:
+            lg.disabled = prev_d
+        self._prewarm_mods = frozenset(
+            m for m in sys.modules if m == "sqlglot" or m == "tests" or m.startswith(("sqlglot.", "tests."))
+        )
+        self._prewarm_dialects = dict(Dialect._classes)
+
     def _maybe_run_dynamic_probes(self, sel: Set[int], sections: List[Dict[str, Any]]) -> Set[int]:
         if not (self.src_root / "sqlglot/__init__.py").is_file():
             return sel
         patched: Dict[str, bytes] = {}
         deleted: Set[str] = set()
         touched_sqlglot: Set[str] = set()
+        has_non_sqlglot_change = False
+        has_struct_sqlglot_change = False
 
         for sec in sections:
             if sec.get("binary"):
@@ -3878,11 +4287,14 @@ class SelectorEngine:
                 if ap.startswith("sqlglot/") and ap.endswith(".py"):
                     deleted.add(ap)
                     touched_sqlglot.add(ap)
+                    has_struct_sqlglot_change = True
                 elif not (ap.startswith("tests/fixtures/") and "tpc-ds" not in ap and "tpc-h" not in ap):
                     af = ap.rsplit("/", 1)[-1]
                     ae = ("." + af.rsplit(".", 1)[-1].lower()) if "." in af else ""
                     if ae not in _INERT_EXTS and af not in _INERT_NAMES and not ap.startswith(("docs/", ".github/")):
                         return sel
+                else:
+                    has_non_sqlglot_change = True
                 if rp.startswith("sqlglot/") and rp.endswith(".py"):
                     old_txt = self._read_src(ap)
                     if not old_txt and not (self.src_root / ap).is_file():
@@ -3892,19 +4304,24 @@ class SelectorEngine:
                         return sel
                     patched[rp] = ns.encode("utf-8")
                     touched_sqlglot.add(rp)
+                    has_struct_sqlglot_change = True
                 elif not (is_inert or (rp.startswith("tests/fixtures/") and "tpc-ds" not in rp and "tpc-h" not in rp)):
                     return sel
+                elif not is_inert:
+                    has_non_sqlglot_change = True
                 continue
 
             if rp.startswith("sqlglot/") and rp.endswith(".py"):
                 touched_sqlglot.add(rp)
                 if status == "deleted":
                     deleted.add(rp)
+                    has_struct_sqlglot_change = True
                 elif status == "added":
                     ns, ok = apply_hunks_in_memory("", sec["hunks"])
                     if not ok:
                         return sel
                     patched[rp] = ns.encode("utf-8")
+                    has_struct_sqlglot_change = True
                 else:
                     old_txt = self._read_src(rp)
                     if not old_txt and not (self.src_root / rp).is_file():
@@ -3914,36 +4331,59 @@ class SelectorEngine:
                         return sel
                     patched[rp] = ns.encode("utf-8")
             elif rp.startswith("tests/fixtures/") and "tpc-ds" not in rp and "tpc-h" not in rp:
+                has_non_sqlglot_change = True
                 continue
             else:
                 return sel
 
+        if deleted:
+            has_struct_sqlglot_change = True
+
         sim_cur = set(sel)
-        rem_budget = max(0.0, self.probe_cpu_budget_s - self.total_probe_cpu_s)
+        eff_fast_b = (
+            min(self.probe_cpu_budget_s, self._fast_budget_env)
+            if self._fast_budget_env is not None
+            else self.probe_cpu_budget_s
+        )
+        eff_s3_b = min(
+            self.probe_cpu_budget_s,
+            self._s3_budget_env if self._s3_budget_env is not None else self.probe_cpu_budget_s * (15.0 / 45.0),
+        )
+        rem_total = max(0.0, self.probe_cpu_budget_s - self.total_probe_cpu_s)
+        rem_p1 = min(rem_total, max(0.0, eff_fast_b - self.fast_probe_cpu_s))
+        rem_s3 = min(rem_total, max(0.0, eff_s3_b - self.s3_probe_cpu_s))
+
         want_a = False
         want_b = False
         want_c = False
         want_d = False
+        want_e = False
         require_a_for_b = False
         require_a_for_d = False
         require_b_for_d = False
+        require_prev_for_e = False
+        worker_alive_after_e = False
         b_exec_qids: List[int] = []
         s3_exec_qids: List[int] = []
+        fast_cands: List[int] = []
         touches_opt = True
         touches_exec = True
         est_b = 0.0
         est_d = 0.0
+        p1_est = 0.0
+        s3_est = 0.0
 
         if (
             self.max_nodes_num is not None
             and self.max_nodes_num in sim_cur
             and self.max_nodes_files
             and not (touched_sqlglot & self.max_nodes_files)
-            and rem_budget >= 0.25
+            and rem_p1 >= 0.25
         ):
             sav_a = self._packed_cost_ms(sim_cur) - self._packed_cost_ms(sim_cur - {self.max_nodes_num})
             if sav_a > 3000:
                 want_a = True
+                p1_est += 0.20
                 sim_cur.remove(self.max_nodes_num)
 
         if self.tpcds_num is not None and self.tpcds_num in sim_cur and self.tpcds_digests:
@@ -3953,10 +4393,20 @@ class SelectorEngine:
             else:
                 b_exec_qids = [q for q in self.tpcds_exec_qids if (self._tpcds_cov_qmask >> q) & 1]
             touches_opt, touches_exec = self._classify_tpcds_stages(touched_sqlglot)
-            if not touches_opt:
-                est_b = (0.0 if want_a else 0.20) + 0.65
-            elif not touches_exec:
-                est_b = (0.0 if want_a else 0.20) + 0.25 + 0.052 * len(b_exec_qids)
+            sav_b = (self._packed_cost_ms(sim_cur) - self._packed_cost_ms(sim_cur - {self.tpcds_num})) / 1000.0
+            if not touches_opt or not touches_exec:
+                if not touches_opt:
+                    est_b = (0.0 if want_a else 0.20) + 0.65
+                else:
+                    est_b = (0.0 if want_a else 0.20) + 0.25 + 0.052 * len(b_exec_qids)
+                thresh_b = max(3.0, est_b + 1.5)
+                if sav_b > thresh_b and rem_p1 >= p1_est + est_b and rem_total >= p1_est + est_b:
+                    want_b = True
+                    p1_est += est_b
+                    if want_a:
+                        sav_b_no_a = (self._packed_cost_ms(sel) - self._packed_cost_ms(sel - {self.tpcds_num})) / 1000.0
+                        require_a_for_b = sav_b_no_a <= thresh_b
+                    sim_cur.remove(self.tpcds_num)
             else:
                 force_exec = any(
                     p.startswith("sqlglot/executor/") or p in _TPCDS_FORCE_EXEC_FILES for p in touched_sqlglot
@@ -3967,22 +4417,16 @@ class SelectorEngine:
                     s3_exec_qids = list(b_exec_qids)
                 n_s3 = len(s3_exec_qids)
                 n_s2_rem = max(0, len(b_exec_qids) - n_s3)
-                est_b = (
-                    (0.0 if want_a else 0.20)
-                    + 0.18
-                    + 0.205 * n_s3
-                    + 0.052 * n_s2_rem
-                    + (0.42 if (n_s3 and self._raw_tpcds_tables is None) else 0.0)
-                )
-            sav_b = (self._packed_cost_ms(sim_cur) - self._packed_cost_ms(sim_cur - {self.tpcds_num})) / 1000.0
-            thresh_b = max(3.0, est_b + 1.5)
-            est_total_so_far = (0.20 if want_a else 0.0) + est_b
-            if sav_b > thresh_b and rem_budget >= est_total_so_far:
-                want_b = True
-                if want_a:
-                    sav_b_no_a = (self._packed_cost_ms(sel) - self._packed_cost_ms(sel - {self.tpcds_num})) / 1000.0
-                    require_a_for_b = sav_b_no_a <= thresh_b
-                sim_cur.remove(self.tpcds_num)
+                if 0 < n_s3 <= self.max_s3_exec_qids:
+                    est_b = (0.0 if want_a else 0.20) + 0.18 + 0.205 * n_s3 + 0.052 * n_s2_rem + 0.08
+                    thresh_b = max(4.0, est_b + 3.0)
+                    if sav_b > thresh_b and rem_s3 >= est_b and rem_total >= p1_est + est_b:
+                        want_b = True
+                        s3_est = est_b
+                        if want_a:
+                            sav_b_no_a = (self._packed_cost_ms(sel) - self._packed_cost_ms(sel - {self.tpcds_num})) / 1000.0
+                            require_a_for_b = sav_b_no_a <= thresh_b
+                        sim_cur.remove(self.tpcds_num)
 
         if self.gen_mem_num is not None and self.gen_mem_num in sim_cur:
             is_core_gm = not touched_sqlglot or not all(
@@ -3993,9 +4437,9 @@ class SelectorEngine:
             est_d = (0.0 if (want_a or want_b) else 0.10) + (1.25 if is_core_gm else 0.30)
             sav_d = (self._packed_cost_ms(sim_cur) - self._packed_cost_ms(sim_cur - {self.gen_mem_num})) / 1000.0
             thresh_d = max(3.0, est_d + 1.0)
-            est_total_with_d = (0.20 if want_a else 0.0) + (est_b if want_b else 0.0) + est_d
-            if sav_d > thresh_d and rem_budget >= est_total_with_d:
+            if sav_d > thresh_d and rem_p1 >= p1_est + est_d and rem_total >= p1_est + s3_est + est_d:
                 want_d = True
+                p1_est += est_d
                 if want_a:
                     sav_d_no_a = (self._packed_cost_ms(sel) - self._packed_cost_ms(sel - {self.gen_mem_num})) / 1000.0
                     require_a_for_d = sav_d_no_a <= thresh_d
@@ -4011,23 +4455,73 @@ class SelectorEngine:
 
         if self.tpch_num is not None and self.tpch_num in sim_cur and self.tpch_digests:
             sav_c = self._packed_cost_ms(sim_cur) - self._packed_cost_ms(sim_cur - {self.tpch_num})
-            est_c_total = (0.20 if want_a else 0.0) + (est_b if want_b else 0.0) + (est_d if want_d else 0.0) + 0.20
-            if sav_c > 2500 and rem_budget >= est_c_total:
+            if sav_c > 2500 and rem_p1 >= p1_est + 0.20 and rem_total >= p1_est + s3_est + 0.20:
                 want_c = True
+                p1_est += 0.20
+                sim_cur.remove(self.tpch_num)
 
-        if not (want_a or want_b or want_c or want_d):
+        if self._rule_enabled("fast_test_probe") and not has_non_sqlglot_change:
+            excl = self._fast_unprobed_nums | (
+                self._pkg_dir_walker_nums if has_struct_sqlglot_change else frozenset()
+            )
+            fast_cands = sorted(n for n in sim_cur if n not in excl)
+            sum_dur_s = sum(self.num_to_ms[n] for n in fast_cands) / 1000.0
+            if 1 <= len(fast_cands) <= 65 and sum_dur_s <= 3.0:
+                n_files = len({self.num_to_parts[n][0] for n in fast_cands if self.num_to_parts[n] is not None})
+                fork_ovh = 0.0 if (want_a or want_b or want_c or want_d) else 0.09
+                est_e = fork_ovh + 0.015 * n_files + 1.15 * sum_dur_s
+                sav_e = (self._packed_cost_ms(sim_cur) - self._packed_cost_ms(sim_cur - set(fast_cands))) / 1000.0
+                if (
+                    sav_e >= 1.8
+                    and est_e <= 0.48 * sav_e
+                    and rem_p1 >= p1_est + est_e
+                    and rem_total >= p1_est + s3_est + est_e
+                ):
+                    want_e = True
+                    p1_est += est_e
+                    worker_alive_after_e = bool(sim_cur - set(fast_cands))
+                    sav_e_alone = (self._packed_cost_ms(sel) - self._packed_cost_ms(sel - set(fast_cands))) / 1000.0
+                    require_prev_for_e = (want_a or want_b or want_c or want_d) and (
+                        sav_e_alone < 1.8 or est_e > 0.48 * sav_e_alone
+                    )
+
+        if not (want_a or want_b or want_c or want_d or want_e):
             return sel
 
+        touched_mod_names = {
+            (p[:-12] if p.endswith("/__init__.py") else p[:-3]).replace("/", ".")
+            for p in touched_sqlglot
+            if p.endswith(".py")
+        }
         cpu0 = _total_cpu_seconds()
         try:
+            self._ensure_prewarmed_sqlglot()
+            can_reuse_prewarm = bool(
+                self._prewarm_mods
+                and not has_struct_sqlglot_change
+                and not (touched_mod_names & self._prewarm_mods)
+            )
+            if want_e:
+                if not can_reuse_prewarm:
+                    self._ensure_compiled_rel("tests/__init__.py")
+                    self._ensure_compiled_rel("tests/helpers.py")
+                    self._ensure_compiled_rel("tests/dialects/__init__.py")
+                    self._ensure_compiled_rel("tests/dialects/test_dialect.py")
+                for tfile in {self.num_to_parts[n][0] for n in fast_cands if self.num_to_parts[n] is not None}:
+                    self._ensure_compiled_rel(tfile)
             tpcds_sqls = self._get_tpcds_sqls() if want_b else []
             tpcds_schema = self._load_tpcds_schema() if want_b else {}
-            raw_tables = self._ensure_raw_tpcds_tables() if (want_b and touches_exec and s3_exec_qids) else {}
+            raw_tables = (
+                self._preload_tpcds_tables_for_qids(s3_exec_qids)
+                if (want_b and touches_exec and s3_exec_qids)
+                else {}
+            )
             tpch_sqls = self._get_tpch_sqls() if want_c else []
         except Exception:
             dt = max(0.0, _total_cpu_seconds() - cpu0)
             self.last_probe_cpu_s = dt
             self.total_probe_cpu_s += dt
+            self.fast_probe_cpu_s += dt
             return sel
 
         sys.stdout.flush()
@@ -4047,18 +4541,31 @@ class SelectorEngine:
                 os.environ["SKIP_INTEGRATION"] = "0"
                 signal.alarm(30)
 
-                for mod_name in [
-                    m
-                    for m in list(sys.modules)
-                    if m == "sqlglot" or m.startswith("sqlglot.") or m == "tests" or m.startswith("tests.")
-                ]:
-                    del sys.modules[mod_name]
+                if can_reuse_prewarm and self._prewarm_mods:
+                    for mod_name in [
+                        m
+                        for m in list(sys.modules)
+                        if (m == "sqlglot" or m.startswith("sqlglot.") or m == "tests" or m.startswith("tests."))
+                        and m not in self._prewarm_mods
+                    ]:
+                        del sys.modules[mod_name]
+                    from sqlglot.dialects.dialect import Dialect
+
+                    Dialect._classes.clear()
+                    Dialect._classes.update(self._prewarm_dialects)
+                else:
+                    for mod_name in [
+                        m
+                        for m in list(sys.modules)
+                        if m == "sqlglot" or m.startswith("sqlglot.") or m == "tests" or m.startswith("tests.")
+                    ]:
+                        del sys.modules[mod_name]
                 gc.freeze()
 
                 src_str = str(self.src_root)
                 if src_str not in sys.path:
                     sys.path.insert(0, src_str)
-                sys.meta_path.insert(0, PatchOverlayFinder(self.src_root, patched, deleted))
+                sys.meta_path.insert(0, PatchOverlayFinder(self.src_root, patched, deleted, self._code_cache))
 
                 if want_a:
                     try:
@@ -4132,6 +4639,30 @@ class SelectorEngine:
                         res["c"] = c_ok
                     except BaseException:
                         res["c"] = False
+
+                if want_e:
+                    prev_ok = (
+                        (not want_a or res.get("a") is True)
+                        and (not want_b or res.get("b") is True)
+                        and (not want_c or res.get("c") is True)
+                        and (not want_d or res.get("d") is True)
+                    )
+                    if not require_prev_for_e or prev_ok:
+                        try:
+                            gc.freeze()
+                            _install_fast_probe_sandbox()
+                            alive_now = bool(
+                                worker_alive_after_e
+                                or (want_a and res.get("a") is not True)
+                                or (want_b and res.get("b") is not True)
+                                or (want_c and res.get("c") is not True)
+                                or (want_d and res.get("d") is not True)
+                            )
+                            res["e_ran"] = True
+                            res["e_pass"] = self._probe_fast_tests(fast_cands, touched_sqlglot, alive_now)
+                        except BaseException:
+                            res["e_ran"] = False
+                            res["e_pass"] = []
             except BaseException:
                 res = {}
 
@@ -4173,13 +4704,19 @@ class SelectorEngine:
         dt_cpu = max(0.0, _total_cpu_seconds() - cpu0)
         self.last_probe_cpu_s = dt_cpu
         self.total_probe_cpu_s += dt_cpu
-
         probe_res: Dict[str, Any] = {}
         if not timed_out and chunks:
             try:
                 probe_res = json.loads(b"".join(chunks).decode("ascii"))
             except Exception:
                 probe_res = {}
+
+        if s3_est > 0.0 and not (require_a_for_b and probe_res.get("a") is not True):
+            s3_share = dt_cpu * (s3_est / max(1e-6, p1_est + s3_est))
+            self.s3_probe_cpu_s += s3_share
+            self.fast_probe_cpu_s += max(0.0, dt_cpu - s3_share)
+        else:
+            self.fast_probe_cpu_s += dt_cpu
 
         out = set(sel)
         if want_a:
@@ -4215,6 +4752,16 @@ class SelectorEngine:
                     self._note("probe_drop:gen_mem")
             elif self._trace:
                 self._note("probe_keep:gen_mem")
+        if want_e and probe_res.get("e_ran") is True:
+            cset = set(fast_cands)
+            e_pass = [int(x) for x in probe_res.get("e_pass", ()) if int(x) in cset]
+            for n in e_pass:
+                out.discard(n)
+            if self._trace:
+                if e_pass:
+                    self._note(f"probe_drop:fast:{len(e_pass)}/{len(fast_cands)}")
+                else:
+                    self._note(f"probe_keep:fast:0/{len(fast_cands)}")
 
         return out
 
