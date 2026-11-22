@@ -1946,7 +1946,7 @@ class SelectorEngine:
         self._s3_budget_env: Optional[float] = (
             float(os.environ["BLAST_S3_BUDGET_S"]) if "BLAST_S3_BUDGET_S" in os.environ else None
         )
-        self.max_s3_exec_qids: int = int(os.environ.get("BLAST_MAX_S3_QIDS", "32"))
+        self.max_s3_exec_qids: int = int(os.environ.get("BLAST_MAX_S3_QIDS", "57"))
         self.total_probe_cpu_s: float = 0.0
         self.fast_probe_cpu_s: float = 0.0
         self.s3_probe_cpu_s: float = 0.0
@@ -1955,6 +1955,10 @@ class SelectorEngine:
         self._raw_tpcds_tables: Optional[Dict[str, Tuple[Dict[str, str], List[tuple]]]] = None
         self._tpcds_table_cache: Dict[str, Tuple[Dict[str, str], List[tuple]]] = {}
         self._tpcds_opt_asts_cache: Optional[Dict[int, Any]] = None
+        self._tpcds_cached_plan_digs: Optional[Dict[int, str]] = None
+        self._tpcds_fresh_plan_digs: Optional[Dict[int, str]] = None
+        self._tpcds_dk_sqls_cache: Optional[Dict[int, str]] = None
+        self._tpcds_env_guard_digest: Optional[str] = None
         self._tpcds_s2_seen_count: int = 0
         self._tpcds_s1_parsed_cache: Optional[List[Tuple[Any, str]]] = None
         self._tpcds_pairs_full_cache: Optional[List[Tuple[Dict[str, str], str, str]]] = None
@@ -4115,10 +4119,11 @@ class SelectorEngine:
         ) and bool(self.opt_tpcds_s2_lines or self.opt_tpcds_qcov)
 
     def _probe_gen_memory(self, touched_sqlglot: Set[str]) -> bool:
-        """Run MRO-filtered tracemalloc dialect.generator() leak probe inside forked child."""
+        """Run transitive MRO-filtered, lazy-GC tracemalloc dialect.generator() leak probe."""
         import tracemalloc
         import tests.test_generator  # noqa: F401
         from sqlglot.dialects import Dialect, Dialects
+        from sqlglot.generator import Generator  # noqa: F401
 
         loaded = []
         for name in Dialects:
@@ -4126,38 +4131,70 @@ class SelectorEngine:
             d.generator()
             loaded.append((name, d))
 
-        touched_mods = {p[:-3].replace("/", ".") for p in touched_sqlglot if p.endswith(".py")}
-        active_mods = touched_mods & set(sys.modules.keys())
+        affected_mods: Set[str] = {
+            (p[:-12] if p.endswith("/__init__.py") else p[:-3]).replace("/", ".")
+            for p in touched_sqlglot
+            if p.endswith(".py")
+        }
+        work = list(touched_sqlglot)
+        seen_paths = set(touched_sqlglot)
+        while work:
+            cur = work.pop()
+            for rev in self.rev_imports.get(cur, ()):
+                if rev.startswith("sqlglot/") and rev not in seen_paths:
+                    seen_paths.add(rev)
+                    work.append(rev)
+                    if rev.endswith(".py"):
+                        affected_mods.add(
+                            (rev[:-12] if rev.endswith("/__init__.py") else rev[:-3]).replace("/", ".")
+                        )
 
-        if touched_sqlglot and (not active_mods or all(_is_leaf_gen_mod(m) for m in active_mods)):
+        if (
+            not touched_sqlglot
+            or "sqlglot.generator" in affected_mods
+            or "sqlglot.dialects.dialect" in affected_mods
+        ):
+            target_dialects = loaded
+        else:
             target_dialects = [
                 (name, d)
                 for name, d in loaded
                 if name == ""
                 or any(
-                    c.__module__ in active_mods
+                    c.__module__ in affected_mods
                     for root_cls in (type(d), d.generator_class, d.parser_class, d.tokenizer_class)
                     for c in root_cls.__mro__
                 )
             ]
-        else:
-            target_dialects = loaded
 
+        gc.collect()
         for _, dialect in target_dialects:
             for _ in range(100):
                 dialect.generator()
-            gc.collect()
             tracemalloc.start()
             try:
                 before = tracemalloc.get_traced_memory()[0]
                 for _ in range(1000):
                     dialect.generator()
-                gc.collect()
                 after = tracemalloc.get_traced_memory()[0]
+                if after - before >= 1024:
+                    gc.collect()
+                    after = tracemalloc.get_traced_memory()[0]
             finally:
                 tracemalloc.stop()
             if not (after - before < 1024):
-                return False
+                gc.collect()
+                tracemalloc.start()
+                try:
+                    before = tracemalloc.get_traced_memory()[0]
+                    for _ in range(1000):
+                        dialect.generator()
+                    gc.collect()
+                    after = tracemalloc.get_traced_memory()[0]
+                finally:
+                    tracemalloc.stop()
+                if not (after - before < 1024):
+                    return False
         return True
 
     def _can_use_cached_tpcds_s1(self, touched_sqlglot: Set[str], has_struct_sqlglot_change: bool) -> bool:
@@ -4192,6 +4229,243 @@ class SelectorEngine:
             self._tpcds_s1_parsed_cache = out
         return self._tpcds_s1_parsed_cache
 
+    @staticmethod
+    def _compute_tpcds_env_guard(tpcds_schema: Dict[str, Dict[str, str]], schema_obj: Any) -> Tuple[Any, str]:
+        from sqlglot import exp
+        from sqlglot.executor.table import Table, ensure_tables
+        from sqlglot.generator import Generator
+        from sqlglot.helper import PYTHON_VERSION, dict_depth, is_int, seq_get
+
+        tabs_guard = ensure_tables(
+            {t: Table(columns=cols, rows=[]) for t, cols in tpcds_schema.items()},
+            dialect=None,
+        )
+        if tabs_guard.supported_table_args and tabs_guard.supported_table_args != schema_obj.supported_table_args:
+            raise RuntimeError("Tables must support the same table args as schema")
+        payload = [
+            sorted((str(k), str(v)) for k, v in Generator.TIME_PART_SINGULARS.items()),
+            sorted(str(x) for x in exp.DataType.TEXT_TYPES),
+            sorted(str(x) for x in exp.DataType.NUMERIC_TYPES),
+            [str(getattr(exp.DType, k, None)) for k in ("DATE", "TIME", "DATETIME", "TIMESTAMP", "BOOLEAN", "FLOAT", "DOUBLE")],
+            [
+                bool(PYTHON_VERSION >= (3, 8)),
+                is_int("1"),
+                is_int("-2"),
+                is_int("x"),
+                seq_get([7], 0),
+                seq_get([7], 3),
+                dict_depth({"a": 1}),
+                dict_depth({"a": {"b": 1}}),
+            ],
+            [(t, tuple(tabs_guard.find(exp.to_table(t)).columns)) for t in sorted(tpcds_schema)],
+        ]
+        return tabs_guard, _canon_digest(payload)
+
+    @staticmethod
+    def _compute_plan_codegen_digest(opt_q: Any, tabs_guard: Any) -> str:
+        from sqlglot import exp
+        from sqlglot.executor.python import PythonExecutor
+        from sqlglot.planner import Plan
+
+        pe = PythonExecutor()
+        gen = pe.generator
+
+        def _code_str(e: Any) -> Any:
+            if not e:
+                return None
+            saved_plans = pe._subquery_plans
+            saved_names = pe._plan_names_by_sql
+            pe._subquery_plans = {}
+            pe._plan_names_by_sql = {}
+            try:
+                replaced = pe._replace_subqueries(e)
+                local_plans = pe._subquery_plans
+                sql_code = gen.generate(replaced)
+            finally:
+                pe._subquery_plans = saved_plans
+                pe._plan_names_by_sql = saved_names
+            if not local_plans:
+                return sql_code
+            sq_reps = [(k, _ser_plan(local_plans[k][0])) for k in sorted(local_plans.keys())]
+            return (sql_code, sq_reps)
+
+        def _expr_cols(exprs: Any) -> List[str]:
+            return [e.alias_or_name if isinstance(e, exp.Expr) else str(e) for e in (exprs or ())]
+
+        def _ser_plan(pl: Any) -> str:
+            prev_ctes = pe._ctes
+            pe._ctes = getattr(pl, "ctes", None)
+            memo: Dict[Any, str] = {}
+            try:
+                def _visit_hash(node: Any) -> str:
+                    if node in memo:
+                        return memo[node]
+                    dep_digs = sorted(_visit_hash(d) for d in (getattr(node, "dependencies", ()) or ()))
+                    cls_n = type(node).__name__
+                    lim = repr(getattr(node, "limit", None))
+                    off = getattr(node, "offset", 0)
+                    src = getattr(node, "source", None)
+                    if isinstance(src, exp.Expr):
+                        found_cols: Optional[Tuple[str, ...]] = None
+                        if src.name:
+                            try:
+                                found = tabs_guard.find(src)
+                                if found is not None:
+                                    found_cols = tuple(found.columns)
+                            except Exception:
+                                found_cols = ("ERR",)
+                        src_s: Any = ("E", src.name or src.alias, src.alias_or_name, found_cols)
+                    else:
+                        src_s = ("S", str(src))
+                    projs = [
+                        (_code_str(p), p.alias_or_name if isinstance(p, exp.Expr) else str(p))
+                        for p in (getattr(node, "projections", None) or ())
+                    ]
+                    cond = _code_str(getattr(node, "condition", None))
+                    extra: List[Any] = []
+                    if cls_n == "Join":
+                        extra.append(getattr(node, "source_name", None))
+                        for jn, jd in (getattr(node, "joins", None) or {}).items():
+                            extra.append((
+                                jn,
+                                jd.get("side"),
+                                [_code_str(x) for x in (jd.get("source_key") or ())],
+                                [_code_str(x) for x in (jd.get("join_key") or ())],
+                                _code_str(jd.get("condition")),
+                            ))
+                    elif cls_n == "Aggregate":
+                        grp = getattr(node, "group", None) or {}
+                        extra.append([
+                            list(grp.keys()),
+                            [_code_str(x) for x in grp.values()],
+                            _expr_cols(getattr(node, "aggregations", None)),
+                            [_code_str(x) for x in (getattr(node, "aggregations", None) or ())],
+                            _expr_cols(getattr(node, "operands", None)),
+                            [_code_str(x) for x in (getattr(node, "operands", None) or ())],
+                        ])
+                    elif cls_n == "Sort":
+                        extra.append([_code_str(x) for x in (getattr(node, "key", None) or ())])
+                    elif cls_n == "SetOperation":
+                        op = getattr(node, "op", None)
+                        extra.append((
+                            getattr(node, "left", None),
+                            getattr(node, "right", None),
+                            bool(isinstance(op, type) and issubclass(op, exp.Intersect)),
+                            bool(isinstance(op, type) and issubclass(op, exp.Except)),
+                            bool(isinstance(op, type) and issubclass(op, exp.Union)),
+                            getattr(node, "distinct", None),
+                        ))
+                    dig = _canon_digest(
+                        (cls_n, getattr(node, "name", None), dep_digs, lim, off, src_s, projs, cond, extra)
+                    )
+                    memo[node] = dig
+                    return dig
+
+                return _visit_hash(pl.root) if pl.root is not None else "EMPTY"
+            finally:
+                pe._ctes = prev_ctes
+
+        return _ser_plan(Plan(opt_q))
+
+    def _ensure_tpcds_plan_digests_cache(
+        self, need_fresh: bool = False
+    ) -> Tuple[Dict[int, str], Dict[int, str], Dict[int, str], str]:
+        need_c = (
+            self._tpcds_cached_plan_digs is None
+            or self._tpcds_dk_sqls_cache is None
+            or self._tpcds_env_guard_digest is None
+        )
+        need_f = need_fresh and self._tpcds_fresh_plan_digs is None
+        if need_c or need_f:
+            self._ensure_prewarmed_sqlglot()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            r_fd, w_fd = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.close(r_fd)
+                try:
+                    devnull = os.open(os.devnull, os.O_WRONLY)
+                    os.dup2(devnull, 1)
+                    os.dup2(devnull, 2)
+                    if devnull > 2:
+                        os.close(devnull)
+                    sys.dont_write_bytecode = True
+                    signal.alarm(35)
+                    from sqlglot import parse_one, transpile
+                    from sqlglot.optimizer import optimize
+                    from sqlglot.schema import ensure_schema
+
+                    tpcds_schema = self._load_tpcds_schema()
+                    schema_obj = ensure_schema(tpcds_schema, dialect=None)
+                    sqls = self._get_tpcds_sqls()
+                    tabs_guard, env_dig = self._compute_tpcds_env_guard(tpcds_schema, schema_obj)
+                    if need_c:
+                        opt_asts = self._get_tpcds_opt_asts() or {}
+                        dk_sqls = {
+                            str(qi): (
+                                self._tpcds_s1_parsed_cache[qi][1]
+                                if self._tpcds_s1_parsed_cache is not None
+                                else transpile(sqls[qi][1], write="duckdb")[0]
+                            )
+                            for qi in self.tpcds_exec_qids
+                        }
+                        c_digs = {
+                            str(qi): self._compute_plan_codegen_digest(opt_asts[qi], tabs_guard)
+                            for qi in self.tpcds_exec_qids
+                        }
+                    else:
+                        c_digs, dk_sqls = {}, {}
+                    if need_f:
+                        f_digs: Dict[str, str] = {}
+                        for qi in self.tpcds_exec_qids:
+                            ast_q = (
+                                self._tpcds_s1_parsed_cache[qi][0]
+                                if self._tpcds_s1_parsed_cache is not None
+                                else pickle.loads(pickle.dumps(parse_one(sqls[qi][1])))
+                            )
+                            opt_q = optimize(ast_q.copy(), schema_obj, leave_tables_isolated=True, dialect=None)
+                            f_digs[str(qi)] = self._compute_plan_codegen_digest(opt_q, tabs_guard)
+                    else:
+                        f_digs = {}
+                    payload_bytes = json.dumps([c_digs, f_digs, dk_sqls, env_dig]).encode("ascii")
+                    view = memoryview(payload_bytes)
+                    sent = 0
+                    while sent < len(view):
+                        sent += os.write(w_fd, view[sent:])
+                except BaseException:
+                    pass
+                finally:
+                    try:
+                        os.close(w_fd)
+                    except BaseException:
+                        pass
+                    os._exit(0)
+            os.close(w_fd)
+            chunks: List[bytes] = []
+            while True:
+                b = os.read(r_fd, 65536)
+                if not b:
+                    break
+                chunks.append(b)
+            os.close(r_fd)
+            os.waitpid(pid, 0)
+            if not chunks:
+                raise RuntimeError("plan digests child failed")
+            raw_c, raw_f, raw_dks, env_dig = json.loads(b"".join(chunks).decode("ascii"))
+            if need_c:
+                self._tpcds_cached_plan_digs = {int(k): str(v) for k, v in raw_c.items()}
+                self._tpcds_dk_sqls_cache = {int(k): str(v) for k, v in raw_dks.items()}
+                self._tpcds_env_guard_digest = str(env_dig)
+            if need_f:
+                self._tpcds_fresh_plan_digs = {int(k): str(v) for k, v in raw_f.items()}
+        return (
+            self._tpcds_cached_plan_digs or {},
+            self._tpcds_fresh_plan_digs or {},
+            self._tpcds_dk_sqls_cache or {},
+            self._tpcds_env_guard_digest or "",
+        )
+
     def _probe_tpcds(
         self,
         tpcds_sqls: List[Tuple[bool, str]],
@@ -4204,8 +4478,9 @@ class SelectorEngine:
         touched_sqlglot: Optional[Set[str]] = None,
         has_struct_sqlglot_change: bool = False,
         s1_cache: Optional[List[Tuple[Any, str]]] = None,
+        plan_cache: Optional[Tuple[Dict[int, str], Dict[int, str], Dict[int, str], str]] = None,
     ) -> Tuple[bool, str]:
-        """3-stage streaming deterministic probe for test_execute_tpcds with direct Plan execution."""
+        """3-stage streaming deterministic probe for test_execute_tpcds with direct Plan+Codegen short-circuit."""
         from sqlglot import exp, find_tables, parse_one, transpile
         from sqlglot.executor import execute
         from sqlglot.executor.python import Python, PythonExecutor
@@ -4219,6 +4494,7 @@ class SelectorEngine:
 
         touched = touched_sqlglot or set()
         can_direct_plan = "sqlglot/executor/__init__.py" not in touched
+        touches_executor_pkg = any(p.startswith("sqlglot/executor/") for p in touched)
         can_cached_opt = (
             can_direct_plan
             and not has_struct_sqlglot_change
@@ -4336,9 +4612,21 @@ class SelectorEngine:
         s3_set = set(b_exec_qids if s3_exec_qids is None else s3_exec_qids)
         schema_obj = None
         used_s2 = False
+        used_plan_sc = False
         s3_ran = 0
         fail_stage = f"s3({len(s3_set)})" if len(s3_set) < len(b_exec_qids) else "s3"
+        can_plan_sc = False
+        tabs_guard: Any = None
+        cached_plan_digs: Dict[int, str] = {}
+        fresh_plan_digs: Dict[int, str] = {}
+        base_dk_sqls: Dict[int, str] = {}
         try:
+            if not touches_executor_pkg and can_direct_plan and plan_cache is not None:
+                cached_plan_digs, fresh_plan_digs, base_dk_sqls, base_env_dig = plan_cache
+                schema_obj = ensure_schema(tpcds_schema, dialect=None)
+                tabs_guard, cur_env_dig = self._compute_tpcds_env_guard(tpcds_schema, schema_obj)
+                can_plan_sc = (cur_env_dig == base_env_dig)
+
             for qi in sorted(b_exec_qids, key=lambda q: len(tpcds_sqls[q][1])):
                 if s1_cache is not None:
                     ast_q, dk_sql = s1_cache[qi]
@@ -4346,13 +4634,11 @@ class SelectorEngine:
                     _, sql = tpcds_sqls[qi]
                     ast_q = pickle.loads(pickle.dumps(parse_one(sql)))
                     if not isinstance(ast_q, exp.Expr):
-                        return False, fail_stage
+                        return False, ("s2+plan->s3" if (used_plan_sc and s3_ran > 0) else ("s2+plan" if used_plan_sc else fail_stage))
                     dk_sql = transpile(sql, write="duckdb")[0]
                 if qi in s3_set:
-                    s3_ran += 1
-                    if s3_ran > self.max_s3_exec_qids:
-                        return False, ("s2+s3" if used_s2 else fail_stage)
                     opt_q = None
+                    from_cached_opt = False
                     if can_cached_opt and _canon_digest([repr(ast_q), dk_sql]) == self.tpcds_parse_digests.get(qi):
                         if opt_asts_cache is None:
                             opt_asts_cache = self._get_tpcds_opt_asts()
@@ -4360,12 +4646,30 @@ class SelectorEngine:
                             if schema_obj is None:
                                 schema_obj = ensure_schema(tpcds_schema, dialect=None)
                             opt_q = opt_asts_cache[qi]
+                            from_cached_opt = True
                     if can_direct_plan and opt_q is None:
                         if schema_obj is None:
                             schema_obj = ensure_schema(tpcds_schema, dialect=None)
                         opt_q = optimize(ast_q.copy(), schema_obj, leave_tables_isolated=True, dialect=None)
+                    exp_plan_dig = (
+                        cached_plan_digs.get(qi)
+                        if from_cached_opt
+                        else (fresh_plan_digs.get(qi) or cached_plan_digs.get(qi))
+                    )
+                    if (
+                        can_plan_sc
+                        and opt_q is not None
+                        and exp_plan_dig is not None
+                        and dk_sql == base_dk_sqls.get(qi)
+                        and self._compute_plan_codegen_digest(opt_q, tabs_guard) == exp_plan_dig
+                    ):
+                        used_plan_sc = True
+                        continue
+                    s3_ran += 1
+                    if s3_ran > self.max_s3_exec_qids:
+                        return False, ("s2+plan->s3" if used_plan_sc else ("s2+s3" if used_s2 else fail_stage))
                     if not _exec_one(qi, ast_q, dk_sql, opt_q=opt_q, schema_obj=schema_obj):
-                        return False, ("s2+s3" if used_s2 else fail_stage)
+                        return False, ("s2+plan->s3" if used_plan_sc else ("s2+s3" if used_s2 else fail_stage))
                 else:
                     if not self._tpcds_s2_hit and _canon_digest([repr(ast_q), dk_sql]) == self.tpcds_parse_digests.get(qi):
                         continue
@@ -4375,11 +4679,20 @@ class SelectorEngine:
                     opt_q = optimize(ast_q.copy(), schema_obj, leave_tables_isolated=True, dialect=None)
                     if _canon_digest([repr(opt_q), dk_sql]) == self.tpcds_opt_digests.get(qi):
                         continue
+                    exp_plan_dig = fresh_plan_digs.get(qi) or cached_plan_digs.get(qi)
+                    if (
+                        can_plan_sc
+                        and exp_plan_dig is not None
+                        and dk_sql == base_dk_sqls.get(qi)
+                        and self._compute_plan_codegen_digest(opt_q, tabs_guard) == exp_plan_dig
+                    ):
+                        used_plan_sc = True
+                        continue
                     s3_ran += 1
                     if s3_ran > self.max_s3_exec_qids:
-                        return False, "s2+s3"
+                        return False, ("s2+plan->s3" if used_plan_sc else "s2+s3")
                     if not _exec_one(qi, ast_q, dk_sql, opt_q=opt_q, schema_obj=schema_obj):
-                        return False, "s2+s3"
+                        return False, ("s2+plan->s3" if used_plan_sc else "s2+s3")
             if s1_cache is None:
                 exec_set = set(b_exec_qids)
                 for qi, (_, sql) in enumerate(tpcds_sqls):
@@ -4387,10 +4700,14 @@ class SelectorEngine:
                         continue
                     ast_q = pickle.loads(pickle.dumps(parse_one(sql)))
                     if not isinstance(ast_q, exp.Expr):
-                        return False, ("s2+s3" if used_s2 else fail_stage)
+                        return False, ("s2+plan->s3" if (used_plan_sc and s3_ran > 0) else ("s2+plan" if used_plan_sc else ("s2+s3" if used_s2 else fail_stage)))
+            if used_plan_sc and s3_ran == 0:
+                return True, "s2+plan"
+            if used_plan_sc and s3_ran > 0:
+                return True, "s2+plan->s3"
             return True, fail_stage
         except BaseException:
-            return False, ("s2+s3" if used_s2 else fail_stage)
+            return False, ("s2+plan->s3" if (used_plan_sc and s3_ran > 0) else ("s2+plan" if used_plan_sc else ("s2+s3" if used_s2 else fail_stage)))
 
     def _get_opt_duckdb_conn(self) -> Optional[Any]:
         if not _has_real_mod("duckdb"):
@@ -4655,9 +4972,11 @@ class SelectorEngine:
         fast_cands: Sequence[int],
         touched_sqlglot: Set[str],
         worker_already_alive: bool = False,
-        max_fails: int = 3,
+        max_fails: int = 2,
+        max_cpu_s: float = 2.6,
     ) -> List[int]:
         """Run fast unittest methods in-process inside forked child; return strictly passing test numbers."""
+        t_cpu0 = time.process_time()
         touched_stems = {p[:-3].rsplit("/", 1)[-1] for p in touched_sqlglot if p.endswith(".py")}
         by_cls: Dict[Tuple[str, str], List[Tuple[int, str]]] = defaultdict(list)
         for num in fast_cands:
@@ -4685,7 +5004,8 @@ class SelectorEngine:
         passed: List[int] = []
         opt_real_conn_holder: List[Any] = [None]
         for (tfile, cls_name), items in sorted_groups:
-            if aborted:
+            if aborted or time.process_time() - t_cpu0 >= max_cpu_s:
+                aborted = True
                 break
             if any_kept and all(self.num_to_ms[n] < 400 for n, _ in items):
                 continue
@@ -4742,6 +5062,9 @@ class SelectorEngine:
 
             try:
                 for num, meth_name in items:
+                    if time.process_time() - t_cpu0 >= max_cpu_s:
+                        aborted = True
+                        break
                     if any_kept and self.num_to_ms[num] < 400:
                         continue
                     try:
@@ -4920,6 +5243,7 @@ class SelectorEngine:
         builtins.__import__ = _trace_import  # type: ignore[assignment]
         try:
             import sqlglot  # noqa: F401
+            import sqlglot.serde  # noqa: F401
             from sqlglot.dialects.dialect import Dialect
 
             self._prewarm_core_mods = frozenset(
@@ -5167,6 +5491,7 @@ class SelectorEngine:
         allow_s3: bool = True,
         seq_mode: bool = False,
         skip_keys: Optional[Set[str]] = None,
+        min_item_roi: float = 0.0,
     ) -> Optional[Dict[str, Any]]:
         """Greedily select profitable Tier-1 and (optionally) Stage-3 probes sorted by descending ROI."""
         self._restore_probe_snap(snap)
@@ -5193,6 +5518,7 @@ class SelectorEngine:
                 else list(self.tpcds_exec_qids)
             )
             touches_opt, touches_exec = self._classify_tpcds_stages(touched_sqlglot)
+            touches_executor_pkg = any(p.startswith("sqlglot/executor/") for p in touched_sqlglot)
             if not touches_opt or not touches_exec:
                 b_est = 0.65 if not touches_opt else (0.25 + 0.052 * len(b_exec_qids))
                 b_is_s3 = False
@@ -5204,12 +5530,23 @@ class SelectorEngine:
                     "s3_exec_qids": [],
                     "touches_opt": touches_opt,
                     "touches_exec": touches_exec,
+                    "touches_executor_pkg": touches_executor_pkg,
+                    "can_cached_opt": False,
                     "is_s3": False,
                 }
             else:
+                force_all_exec = any(
+                    p in (
+                        "sqlglot/executor/__init__.py",
+                        "sqlglot/executor/python.py",
+                        "sqlglot/executor/table.py",
+                        "sqlglot/executor/context.py",
+                    )
+                    for p in touched_sqlglot
+                )
                 s3_exec_qids = (
                     [q for q in b_exec_qids if (self._tpcds_s3_qmask >> q) & 1]
-                    if (is_line_mode and self._tpcds_s3_qmask != 0)
+                    if (is_line_mode and not force_all_exec and self._tpcds_s3_qmask != 0)
                     else list(b_exec_qids)
                 )
                 n_s3 = len(s3_exec_qids)
@@ -5223,18 +5560,33 @@ class SelectorEngine:
                         and not any(p.startswith("sqlglot/expressions/") for p in touched_sqlglot)
                         and bool(self.tpcds_opt_asts_zlib)
                     )
-                    per_q = 0.20 if can_cached_opt else 0.23
-                    b_est = 0.16 + per_q * n_s3 + 0.052 * n_s2_rem + (0.06 if can_cached_opt else 0.0)
-                    b_is_s3 = True
+                    use_plan_sc = (
+                        not touches_executor_pkg
+                        and "sqlglot/executor/__init__.py" not in touched_sqlglot
+                        and bool(self.tpcds_opt_asts_zlib)
+                    )
+                    if use_plan_sc:
+                        per_q = 0.017 if can_cached_opt else 0.070
+                        fresh_add = 1.0 if (not can_cached_opt and self._tpcds_fresh_plan_digs is None) else 0.0
+                        b_est = 0.25 + per_q * n_s3 + 0.052 * n_s2_rem + fresh_add
+                        b_is_s3 = False
+                        b_thresh = max(3.5, 1.45 * b_est)
+                    else:
+                        per_q = 0.165 if can_cached_opt else 0.205
+                        b_est = 0.16 + per_q * n_s3 + 0.052 * n_s2_rem + (0.06 if can_cached_opt else 0.0)
+                        b_is_s3 = True
+                        b_thresh = max(4.0, b_est + 2.5)
                     b_meta = {
                         "num": self.tpcds_num,
                         "est": b_est,
-                        "thresh": max(4.5, 1.40 * b_est),
+                        "thresh": b_thresh,
                         "b_exec_qids": b_exec_qids,
                         "s3_exec_qids": s3_exec_qids,
                         "touches_opt": touches_opt,
                         "touches_exec": touches_exec,
-                        "is_s3": True,
+                        "touches_executor_pkg": touches_executor_pkg,
+                        "can_cached_opt": can_cached_opt,
+                        "is_s3": b_is_s3,
                     }
 
         cands: Dict[str, Dict[str, Any]] = {}
@@ -5267,8 +5619,9 @@ class SelectorEngine:
                     or _is_leaf_gen_mod(p[:-3].replace("/", "."))
                     for p in touched_sqlglot
                 )
-                d_est = 1.25 if is_core_gm else 0.30
-                cands["d"] = {"num": self.gen_mem_num, "est": d_est, "min_sav": max(3.0, d_est + 1.0)}
+                d_est = 1.95 if is_core_gm else 0.15
+                d_min_sav = 3.6 if is_core_gm else 1.2
+                cands["d"] = {"num": self.gen_mem_num, "est": d_est, "min_sav": d_min_sav}
 
             if self.opt_tpcds_num is not None and self.opt_tpcds_num in sim_cur and not has_non_sqlglot_change:
                 if not has_struct_sqlglot_change and touched_sqlglot and not (touched_sqlglot & self.opt_tpcds_files):
@@ -5368,6 +5721,8 @@ class SelectorEngine:
                     if not _item_ok(spec, sav_s, inc_est, has_fork):
                         continue
                     roi = sav_s / max(0.05, inc_est)
+                    if (not has_fork or float(spec["est"]) > 0.60) and roi < min_item_roi:
+                        continue
                     if roi > best_roi:
                         best_roi = roi
                         best_k = k
@@ -5405,6 +5760,7 @@ class SelectorEngine:
                 if (
                     b_sav >= (1.0 if has_fork else 2.2)
                     and b_est_sum < 0.45 * b_sav
+                    and (has_fork or (b_sav / max(0.05, b_est_sum)) >= min_item_roi)
                     and rem_p1 >= p1_est + b_est_sum
                     and rem_total >= p1_est + s3_est + b_est_sum
                 ):
@@ -5452,7 +5808,7 @@ class SelectorEngine:
             )
             fast_cands = sorted(n for n in sim_cur if n not in excl)
             sum_dur_s = sum(self.num_to_ms[n] for n in fast_cands) / 1000.0
-            if 1 <= len(fast_cands) <= 300 and sum_dur_s < 14.0:
+            if 1 <= len(fast_cands) <= 600 and sum_dur_s < 35.0:
                 n_files = len({self.num_to_parts[n][0] for n in fast_cands if self.num_to_parts[n] is not None})
                 has_opt_file = any(
                     self.num_to_parts[n] is not None and self.num_to_parts[n][0] == "tests/test_optimizer.py"
@@ -5467,12 +5823,12 @@ class SelectorEngine:
                 dur_est = (
                     sum(
                         (
-                            2.20
+                            2.15
                             if (
                                 self.num_to_parts[n] is not None
                                 and self.num_to_parts[n][:2] == ("tests/test_optimizer.py", "TestOptimizer")
                             )
-                            else 1.05
+                            else 0.98
                         )
                         * self.num_to_ms[n]
                         for n in fast_cands
@@ -5480,7 +5836,7 @@ class SelectorEngine:
                     / 1000.0
                 )
                 fork_add = 0.0 if has_fork else 0.09
-                e_inc = (
+                raw_e_inc = (
                     fork_add
                     + 0.012 * n_files
                     + 0.15 * max(0, len(touched_sqlglot) - 1)
@@ -5488,20 +5844,37 @@ class SelectorEngine:
                     + (0.06 if needs_opt_conn else 0.0)
                     + dur_est
                 )
+                e_inc = min(raw_e_inc, 2.65)
                 sav_e = (self._packed_cost_ms(sim_cur) - self._packed_cost_ms(sim_cur - set(fast_cands))) / 1000.0
+                max_e_ratio = 0.68 if sav_e >= 4.5 else 0.55
                 if (
-                    sav_e >= 1.8
-                    and e_inc < 0.55 * sav_e
+                    raw_e_inc <= 4.2
+                    and sav_e >= 1.8
+                    and e_inc < max_e_ratio * sav_e
+                    and sav_e - e_inc >= 1.0
+                    and (sav_e / max(0.05, e_inc)) >= min_item_roi
                     and rem_p1 >= p1_est + e_inc
                     and rem_total >= p1_est + s3_est + e_inc
                 ):
                     worker_alive_after_e = bool(sim_cur - set(fast_cands))
                     sav_e_alone = (self._packed_cost_ms(sel) - self._packed_cost_ms(sel - set(fast_cands))) / 1000.0
+                    max_ea_ratio = 0.68 if sav_e_alone >= 4.5 else 0.55
                     items["e"] = {
                         "cands": fast_cands,
                         "est": e_inc,
                         "worker_alive": worker_alive_after_e,
-                        "req_deps": tuple(order) if (order and (sav_e_alone < 1.8 or e_inc >= 0.55 * sav_e_alone)) else (),
+                        "req_deps": (
+                            tuple(order)
+                            if (
+                                order
+                                and (
+                                    sav_e_alone < 1.8
+                                    or e_inc >= max_ea_ratio * sav_e_alone
+                                    or sav_e_alone - e_inc < 1.0
+                                )
+                            )
+                            else ()
+                        ),
                     }
                     order.append("e")
                     p1_est += e_inc
@@ -5597,8 +5970,6 @@ class SelectorEngine:
             b_item = items.get("b")
             tpcds_sqls = self._get_tpcds_sqls() if b_item else []
             tpcds_schema = self._load_tpcds_schema() if b_item else {}
-            if b_item and b_item["touches_exec"] and bool(self.tpcds_opt_asts_zlib):
-                self._get_tpcds_opt_asts()
             s1_cache: Optional[List[Tuple[Any, str]]] = None
             if (
                 b_item
@@ -5609,9 +5980,17 @@ class SelectorEngine:
                 self._tpcds_s2_seen_count += 1
                 if self._tpcds_s2_seen_count >= 2:
                     s1_cache = self._ensure_tpcds_s1_parsed_cache()
+            use_plan_cache = bool(
+                b_item
+                and b_item["touches_exec"]
+                and not b_item.get("touches_executor_pkg", True)
+                and bool(self.tpcds_opt_asts_zlib)
+            )
+            need_fresh = bool(b_item and not bool(b_item.get("can_cached_opt", False)))
+            plan_cache = self._ensure_tpcds_plan_digests_cache(need_fresh=need_fresh) if use_plan_cache else None
             raw_tables = (
                 self._preload_tpcds_tables_for_qids(b_item["s3_exec_qids"])
-                if (b_item and b_item["touches_exec"] and b_item["s3_exec_qids"])
+                if (b_item and b_item["touches_exec"] and b_item["s3_exec_qids"] and not use_plan_cache)
                 else {}
             )
             tpch_sqls = self._get_tpch_sqls() if "c" in items else []
@@ -5738,6 +6117,7 @@ class SelectorEngine:
                                 touched_sqlglot=touched_sqlglot,
                                 has_struct_sqlglot_change=has_struct_sqlglot_change,
                                 s1_cache=s1_cache,
+                                plan_cache=plan_cache,
                             )
                             res["b"] = b_ok
                             res["b_stage"] = b_stage
@@ -5792,7 +6172,14 @@ class SelectorEngine:
                             alive_now = bool(spec["worker_alive"]) or any(
                                 res.get(ok_k) is not True for ok_k in order[:e_pos]
                             )
-                            e_pass = self._probe_fast_tests(spec["cands"], touched_sqlglot, alive_now)
+                            e_mf = 1 if (not alive_now and len(spec["cands"]) > 80) else 2
+                            e_pass = self._probe_fast_tests(
+                                spec["cands"],
+                                touched_sqlglot,
+                                alive_now,
+                                max_fails=e_mf,
+                                max_cpu_s=2.6,
+                            )
                             res["e_ran"] = True
                             res["e_pass"] = e_pass
                             res["e_all"] = len(e_pass) == len(spec["cands"])
@@ -6230,6 +6617,7 @@ class SelectorEngine:
             allow_t1: bool,
             allow_s3: bool,
             min_roi: float = 0.0,
+            min_item_roi: float = 0.0,
         ) -> List[int]:
             cand_plans: List[Tuple[float, int, Dict[str, Any]]] = []
             rem_p1, rem_s3, rem_total = self._budget_windows()
@@ -6247,6 +6635,7 @@ class SelectorEngine:
                     allow_t1=allow_t1,
                     allow_s3=allow_s3,
                     skip_keys=tried_keys[idx],
+                    min_item_roi=min_item_roi,
                 )
                 if plan is not None and float(plan["roi"]) >= min_roi:
                     cand_plans.append((-float(plan["roi"]), idx, plan))
@@ -6281,23 +6670,23 @@ class SelectorEngine:
                     dropped_b_idxs.append(idx)
             return dropped_b_idxs
 
-        # Band 1: High-ROI (>= 6x) Tier-1 probes across entire commit batch
-        _schedule_and_run(range(n_commits), allow_t1=True, allow_s3=False, min_roi=6.0)
+        # Band 1: High-ROI (>= 5x) Tier-1 probes across entire commit batch
+        _schedule_and_run(range(n_commits), allow_t1=True, allow_s3=False, min_roi=5.0, min_item_roi=5.0)
 
-        # Band 2: High-ROI (>= 6x) Stage-3 TPC-DS probes (e.g. small-qmask s3) before low-ROI tail
+        # Band 2: High-ROI (>= 4x) Stage-3 TPC-DS probes (e.g. small-qmask s3) before low-ROI tail
         if self.tpcds_num is not None:
             s3_hi = [i for i in range(n_commits) if self.tpcds_num in sels[i]]
             if s3_hi:
-                _schedule_and_run(s3_hi, allow_t1=True, allow_s3=True, min_roi=6.0)
+                _schedule_and_run(s3_hi, allow_t1=True, allow_s3=True, min_roi=4.0, min_item_roi=3.5)
 
-        # Band 3: Remaining Tier-1 probes sorted by descending ROI
-        _schedule_and_run(range(n_commits), allow_t1=True, allow_s3=False, min_roi=0.0)
+        # Band 3: Remaining profitable Tier-1 probes sorted by descending ROI
+        _schedule_and_run(range(n_commits), allow_t1=True, allow_s3=False, min_roi=1.55, min_item_roi=1.45)
 
         # Band 4: Remaining Stage-3 TPC-DS probes (+ any newly unmasked post-b Tier-1 probes in SAME fork)
         if self.tpcds_num is not None:
             s3_cands = [i for i in range(n_commits) if self.tpcds_num in sels[i]]
             if s3_cands:
-                _schedule_and_run(s3_cands, allow_t1=True, allow_s3=True, min_roi=0.0)
+                _schedule_and_run(s3_cands, allow_t1=True, allow_s3=True, min_roi=1.35, min_item_roi=0.0)
 
         return list(zip(sels, reasons_list))
 

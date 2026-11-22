@@ -1802,13 +1802,21 @@ class SelectorUnitTests(unittest.TestCase):
         orig_s3b = eng._s3_budget_env
         eng.max_s3_exec_qids = 57
         eng._s3_budget_env = 25.0
+        p_c = _make_patch(c_rel, c_src, c_new)
         try:
-            sel_c = eng.select_commit(_make_patch(c_rel, c_src, c_new))
+            sel_sc, secs_c, snap_c = eng._select_static_commit(p_c)
+            ctx_c = eng._prepare_probe_context(secs_c)
+            plan_c = eng._plan_commit_probes(sel_sc, snap_c, ctx_c, 45.0, 25.0, 45.0)
+            self.assertEqual(len(plan_c["items"]["b"]["s3_exec_qids"]), 31)
+            sel_c = eng.select_commit(p_c)
         finally:
             eng.max_s3_exec_qids = orig_cap
             eng._s3_budget_env = orig_s3b
         self.assertNotIn(tpcds_num, sel_c)
-        self.assertTrue(any(r.startswith("probe_drop:tpcds:s3(31):") for r in eng.reasons), eng.reasons)
+        self.assertTrue(
+            any(r.startswith(("probe_drop:tpcds:s3(31):", "probe_drop:tpcds:s2+plan:")) for r in eng.reasons),
+            eng.reasons,
+        )
 
         # Non-line (cls_usage on generator.py) keeps _tpcds_non_line = True
         g_rel = "sqlglot/generator.py"
@@ -1980,7 +1988,7 @@ class SelectorUnitTests(unittest.TestCase):
         maps = selector.load_maps(RWX_DIR / "maps/blast_maps.pkl.zlib")
         self.assertGreaterEqual(int(maps.get("version", 0)), 10)
         self.assertLessEqual(len(maps.get("fast_unprobed_ids", ())), 10)
-        self.assertEqual(eng.max_s3_exec_qids, 32)
+        self.assertEqual(eng.max_s3_exec_qids, 57)
         self.assertTrue(bool(eng.tpcds_opt_asts_zlib))
         self.assertEqual(len(eng.opt_tpch_digests), 22)
         self.assertEqual(len(eng.opt_tpcds_parse_digests), 99)
@@ -2122,6 +2130,37 @@ class SelectorUnitTests(unittest.TestCase):
         ):
             self.assertIn(tid, dropped_ids, eng_m.reasons)
             self.assertNotIn(tid, kept_ids)
+
+    def test_v14_stage3_restore_and_plan_shortcircuit(self) -> None:
+        import difflib
+
+        eng = self._make_real_engine()
+        self.assertEqual(eng.max_s3_exec_qids, 57)
+        base = RWX_DIR / "_sqlglot_baseline"
+        pl_rel = "sqlglot/planner.py"
+        pl_src = (base / pl_rel).read_text("utf-8")
+
+        def _make_patch(old_s: str, new_s: str) -> str:
+            return (
+                f"diff --git a/{pl_rel} b/{pl_rel}\nindex 0000000..1111111 100644\n"
+                + "".join(difflib.unified_diff(old_s.splitlines(True), new_s.splitlines(True), f"a/{pl_rel}", f"b/{pl_rel}", n=3))
+            )
+
+        selector.TRACE = True
+        pl_ok = pl_src.replace("class Plan:", "@(lambda c: c)\nclass Plan:", 1)
+        p_ok = _make_patch(pl_src, pl_ok)
+        sel_ok = eng.select_commit(p_ok)
+        self.assertNotIn(eng.tpcds_num, sel_ok, eng.reasons)
+        self.assertIn("probe_drop:tpcds:s2+plan:57", eng.reasons, eng.reasons)
+
+        pl_bad = pl_src.replace(
+            "        self.root: Step = Step.from_expression(self.expression)",
+            "        self.root: Step = Step.from_expression(self.expression)\n        raise RuntimeError('boom')",
+            1,
+        )
+        p_bad = _make_patch(pl_src, pl_bad)
+        sel_bad = eng.select_commit(p_bad)
+        self.assertIn(eng.tpcds_num, sel_bad, eng.reasons)
 
 
 if __name__ == "__main__":
