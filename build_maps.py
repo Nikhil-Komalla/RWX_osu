@@ -2288,9 +2288,10 @@ def run_tpcds_probe_maps(
         sys.path.insert(0, repo_str)
 
     from sqlglot import find_tables, parse_one, transpile
-    from sqlglot.executor import execute
-    from sqlglot.executor.table import Table
+    from sqlglot.executor.python import PythonExecutor
+    from sqlglot.executor.table import Table, ensure_tables
     from sqlglot.optimizer import optimize
+    from sqlglot.planner import Plan
     from sqlglot.schema import ensure_schema
     from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, load_sql_fixture_pairs
 
@@ -2333,42 +2334,77 @@ def run_tpcds_probe_maps(
 
     tpcds_exec_qids: List[int] = []
     tpcds_digests: Dict[int, str] = {}
+    s1_asts: Dict[int, Any] = {}
+    s1_dks: Dict[int, str] = {}
+    s2_opts: Dict[int, Any] = {}
+
+    w_s2_ast = parse_one("SELECT 1")
+    w_s2_schema = ensure_schema({"t": {"a": "INT"}}, dialect=None)
+    w_s3_opt = optimize(
+        parse_one("SELECT a FROM t WHERE a = 1"),
+        w_s2_schema,
+        leave_tables_isolated=True,
+        dialect=None,
+    )
 
     cov = coverage.Coverage(data_file=None, source=[str(repo / "sqlglot")], branch=False)
     cov.start()
     try:
+        cov.switch_context("s1:init")
+        _ = pickle.loads(pickle.dumps(parse_one("SELECT 1")))
+        _ = transpile("SELECT 1", write="duckdb")[0]
         for qi, (meta, sql, _) in enumerate(tpcds_sqls):
-            cov.switch_context(f"q{qi}")
+            cov.switch_context(f"s1:{qi}")
             ast_q = pickle.loads(pickle.dumps(parse_one(sql)))
+            s1_asts[qi] = ast_q
             if meta.get("execute"):
                 tpcds_exec_qids.append(qi)
-                dk_sql = transpile(sql, write="duckdb")[0]
-                tabs = {t.name: tpcds_tables[t.name] for t in find_tables(ast_q)}
-                tbl = execute(ast_q, schema=TPCDS_SCHEMA, tables=tabs)
-                c_cols = [str(c) for c in tbl.columns]
-                c_rows = [[_canon_cell(x) for x in r] for r in tbl.rows]
-                tpcds_digests[int(qi)] = _canon_digest([dk_sql, c_cols, c_rows])
+                s1_dks[qi] = transpile(sql, write="duckdb")[0]
+
+        cov.switch_context("s2:init")
+        schema_obj = ensure_schema(TPCDS_SCHEMA, dialect=None)
+        _ = optimize(w_s2_ast.copy(), w_s2_schema, leave_tables_isolated=True, dialect=None)
+        for qi in tpcds_exec_qids:
+            cov.switch_context(f"s2:{qi}")
+            schema_q = ensure_schema(TPCDS_SCHEMA, dialect=None)
+            s2_opts[qi] = optimize(s1_asts[qi].copy(), schema_q, leave_tables_isolated=True, dialect=None)
+
+        cov.switch_context("s3:init")
+        w_tabs = ensure_tables({"t": Table(["a"], [(1,)])}, dialect=None)
+        _ = PythonExecutor(tables=w_tabs).execute(Plan(w_s3_opt))
+        for qi in tpcds_exec_qids:
+            cov.switch_context(f"s3:{qi}")
+            tabs = {t.name: tpcds_tables[t.name] for t in find_tables(s1_asts[qi])}
+            tables_ = ensure_tables(tabs, dialect=None)
+            if tables_.supported_table_args and tables_.supported_table_args != schema_obj.supported_table_args:
+                raise RuntimeError("Tables must support the same table args as schema")
+            tbl = PythonExecutor(tables=tables_).execute(Plan(s2_opts[qi]))
+            c_cols = [str(c) for c in tbl.columns]
+            c_rows = [[_canon_cell(x) for x in r] for r in tbl.rows]
+            tpcds_digests[int(qi)] = _canon_digest([s1_dks[qi], c_cols, c_rows])
     finally:
         cov.stop()
 
-    schema_obj = ensure_schema(TPCDS_SCHEMA, dialect=None)
     tpcds_parse_digests: Dict[int, str] = {}
     tpcds_opt_digests: Dict[int, str] = {}
-    for qi, (meta, sql, _) in enumerate(tpcds_sqls):
-        ast_q = pickle.loads(pickle.dumps(parse_one(sql)))
-        if meta.get("execute"):
-            dk_sql = transpile(sql, write="duckdb")[0]
+    for qi, _ in enumerate(tpcds_sqls):
+        ast_q = s1_asts[qi]
+        if qi in s1_dks:
+            dk_sql = s1_dks[qi]
             tpcds_parse_digests[int(qi)] = _canon_digest([repr(ast_q), dk_sql])
-            opt_q = optimize(ast_q.copy(), schema_obj, leave_tables_isolated=True, dialect=None)
-            tpcds_opt_digests[int(qi)] = _canon_digest([repr(opt_q), dk_sql])
+            tpcds_opt_digests[int(qi)] = _canon_digest([repr(s2_opts[qi]), dk_sql])
         else:
             tpcds_parse_digests[int(qi)] = _canon_digest(repr(ast_q))
 
     data = cov.get_data()
     exec_set = set(tpcds_exec_qids)
+    all_exec_mask = sum(1 << q for q in tpcds_exec_qids)
     repo_prefix = str(repo.resolve()) + os.sep
     tpcds_query_cov: Dict[str, Dict[int, int]] = {}
     tpcds_parse_cov: Dict[str, List[int]] = {}
+    tpcds_s2_lines: Dict[str, List[int]] = {}
+    tpcds_s3_lines: Dict[str, List[int]] = {}
+    tpcds_s3_query_cov: Dict[str, Dict[int, int]] = {}
     for fname in sorted(data.measured_files()):
         try:
             rfname = str(pathlib.Path(fname).resolve())
@@ -2381,19 +2417,59 @@ def run_tpcds_probe_maps(
             continue
         qmap: Dict[int, int] = {}
         pset: Set[int] = set()
+        s2set: Set[int] = set()
+        s3set: Set[int] = set()
+        s3qmap: Dict[int, int] = {}
         for ln, ctxs in data.contexts_by_lineno(fname).items():
-            qs = {int(c[1:]) for c in ctxs if c and c.startswith("q")}
             emask = 0
-            for q in qs & exec_set:
-                emask |= 1 << q
+            m3 = 0
+            in_p = False
+            in_s2 = False
+            for c in ctxs:
+                if not c:
+                    continue
+                if c == "s1:init":
+                    emask |= all_exec_mask
+                elif c == "s2:init":
+                    emask |= all_exec_mask
+                    in_s2 = True
+                elif c == "s3:init":
+                    emask |= all_exec_mask
+                    m3 |= all_exec_mask
+                elif c.startswith("s1:"):
+                    q = int(c[3:])
+                    if q in exec_set:
+                        emask |= 1 << q
+                    else:
+                        in_p = True
+                elif c.startswith("s2:"):
+                    q = int(c[3:])
+                    emask |= 1 << q
+                    in_s2 = True
+                elif c.startswith("s3:"):
+                    q = int(c[3:])
+                    emask |= 1 << q
+                    m3 |= 1 << q
+            li = int(ln)
             if emask:
-                qmap[int(ln)] = emask
-            if qs - exec_set:
-                pset.add(int(ln))
+                qmap[li] = emask
+            if in_p:
+                pset.add(li)
+            if in_s2:
+                s2set.add(li)
+            if m3:
+                s3set.add(li)
+                s3qmap[li] = m3
         if qmap:
             tpcds_query_cov[rel] = dict(sorted(qmap.items()))
         if pset:
             tpcds_parse_cov[rel] = sorted(pset)
+        if s2set:
+            tpcds_s2_lines[rel] = sorted(s2set)
+        if s3set:
+            tpcds_s3_lines[rel] = sorted(s3set)
+        if s3qmap:
+            tpcds_s3_query_cov[rel] = dict(sorted(s3qmap.items()))
 
     tpch_digests = tuple(_canon_digest(pickle.loads(pickle.dumps(parse_one(sql))).sql()) for _, sql, _ in tpch_sqls)
     elapsed = time.perf_counter() - t0
@@ -2401,6 +2477,7 @@ def run_tpcds_probe_maps(
         f"[Pass 7 tpcds_probe] exec_q={len(tpcds_exec_qids)}/{len(tpcds_sqls)} "
         f"pdig={len(tpcds_parse_digests)} odig={len(tpcds_opt_digests)} "
         f"tpch={len(tpch_digests)} qcov_files={len(tpcds_query_cov)} "
+        f"s2_files={len(tpcds_s2_lines)} s3_files={len(tpcds_s3_lines)} "
         f"pcov_files={len(tpcds_parse_cov)} mn_files={len(max_nodes_files)} in {elapsed:.1f}s",
         file=sys.stderr,
         flush=True,
@@ -2412,6 +2489,9 @@ def run_tpcds_probe_maps(
         "tpcds_opt_digests": tpcds_opt_digests,
         "tpcds_query_cov": tpcds_query_cov,
         "tpcds_parse_cov": tpcds_parse_cov,
+        "tpcds_s2_lines": tpcds_s2_lines,
+        "tpcds_s3_lines": tpcds_s3_lines,
+        "tpcds_s3_query_cov": tpcds_s3_query_cov,
         "tpch_digests": tpch_digests,
         "max_nodes_files": max_nodes_files,
     }
@@ -2422,8 +2502,11 @@ def _main_tpcds_probe_only() -> None:
     maps_path = pathlib.Path(sys.argv[3]).resolve()
     os.chdir(repo)
     payload = pickle.loads(zlib.decompress(maps_path.read_bytes()))
+    old_digests = dict(payload.get("tpcds_digests", {}))
     payload.update(run_tpcds_probe_maps(repo, payload["test_ids"], payload["line_cov"]))
-    payload["version"] = max(int(payload.get("version", 6)), 7)
+    if old_digests:
+        assert old_digests == payload["tpcds_digests"], "tpcds_digests mismatch against previous map!"
+    payload["version"] = max(int(payload.get("version", 7)), 8)
     raw_bytes = pickle.dumps(payload, protocol=5)
     comp_bytes = zlib.compress(raw_bytes, level=9)
     assert len(comp_bytes) < 2 * 1024 * 1024, f"Map too large: {len(comp_bytes)} bytes"
@@ -2477,7 +2560,7 @@ def _augment_main() -> None:
     print(f"[Pass 6] subprocess_test_ids: {payload['subprocess_test_ids']}", file=sys.stderr, flush=True)
     os.chdir(repo)
     payload.update(run_tpcds_probe_maps(repo, payload["test_ids"], payload["line_cov"]))
-    payload["version"] = max(int(payload.get("version", 6)), 7)
+    payload["version"] = max(int(payload.get("version", 7)), 8)
     raw_bytes = pickle.dumps(payload, protocol=5)
     comp_bytes = zlib.compress(raw_bytes, level=9)
     maps_path.write_bytes(comp_bytes)
@@ -2598,7 +2681,7 @@ def main() -> None:
     payload["eq_safe_sites"] = _site_dict_to_frozensets(eq_res.get("safe_sites", {}))
     payload["eq_sites_stats"] = eq_res.get("stats", {})
     payload.update(run_tpcds_probe_maps(repo, test_ids, line_cov))
-    payload["version"] = 7
+    payload["version"] = 8
     raw_bytes = pickle.dumps(payload, protocol=5)
     comp_bytes = zlib.compress(raw_bytes, level=9)
     out_path.write_bytes(comp_bytes)

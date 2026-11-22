@@ -1697,6 +1697,113 @@ class SelectorUnitTests(unittest.TestCase):
         self.assertIn(tpcds_num, sel_2jrq)
         self.assertTrue(any(r.startswith("probe_keep:tpcds:s2->s3:") for r in eng.reasons), eng.reasons)
 
+    def test_v10_line_stage_and_gen_memory_probe(self) -> None:
+        import difflib
+
+        eng = self._make_real_engine()
+        base = RWX_DIR / "_sqlglot_baseline"
+        tpcds_num = eng.tpcds_num
+        gm_num = eng.gen_mem_num
+        self.assertIsNotNone(tpcds_num)
+        self.assertIsNotNone(gm_num)
+        self.assertTrue(eng.tpcds_s2_lines)
+        self.assertTrue(eng.tpcds_s3_lines)
+        self.assertTrue(eng.tpcds_s3_query_cov)
+
+        # 1) Verify > 100 lines moved out of Stage 3 in expressions/*, dialect.py, generator.py
+        for pred in (
+            lambda r: r.startswith("sqlglot/expressions/"),
+            lambda r: r == "sqlglot/dialects/dialect.py",
+            lambda r: r == "sqlglot/generator.py",
+        ):
+            u_all: set[tuple[str, int]] = set()
+            u_s3: set[tuple[str, int]] = set()
+            for r in set(eng.tpcds_query_cov) | set(eng.tpcds_s2_lines) | set(eng.tpcds_s3_lines):
+                if not pred(r):
+                    continue
+                for ln in set(eng.tpcds_query_cov.get(r, {})) | eng.tpcds_s2_lines.get(r, frozenset()) | eng.tpcds_s3_lines.get(r, frozenset()):
+                    u_all.add((r, ln))
+                    if ln in eng.tpcds_s3_lines.get(r, frozenset()):
+                        u_s3.add((r, ln))
+            self.assertGreater(len(u_all - u_s3), 100)
+
+        def _make_patch(rel: str, old_s: str, new_s: str) -> str:
+            return (
+                f"diff --git a/{rel} b/{rel}\nindex 0000000..1111111 100644\n"
+                + "".join(difflib.unified_diff(old_s.splitlines(True), new_s.splitlines(True), f"a/{rel}", f"b/{rel}", n=3))
+            )
+
+        selector.TRACE = True
+
+        # 2) Line-level Stage 1 short-circuit on core file (sqlglot/helper.py:360)
+        h_rel = "sqlglot/helper.py"
+        h_src = (base / h_rel).read_text("utf-8")
+        h_target = "            yield from flatten(value)\n"
+        self.assertIn(h_target, h_src)
+        h_new = h_src.replace(h_target, "            if False:\n                _zz_s1 = 1\n" + h_target, 1)
+        eng._raw_tpcds_tables = None
+        sel_h = eng.select_commit(_make_patch(h_rel, h_src, h_new))
+        self.assertNotIn(tpcds_num, sel_h)
+        self.assertTrue(any(r.startswith("probe_drop:tpcds:s1:") for r in eng.reasons), eng.reasons)
+        self.assertLess(eng.last_probe_cpu_s, 3.0)
+        self.assertIsNone(eng._raw_tpcds_tables)
+
+        # 3) Line-level Stage 2 short-circuit on sqlglot/expressions/builders.py:680
+        b_rel = "sqlglot/expressions/builders.py"
+        b_src = (base / b_rel).read_text("utf-8")
+        b_target = "    for k, v in tuple(expression.args.items()):\n"
+        self.assertIn(b_target, b_src)
+        b_new = b_src.replace(b_target, "    if False:\n        _zz_s2 = 1\n" + b_target, 1)
+        eng._raw_tpcds_tables = None
+        sel_b = eng.select_commit(_make_patch(b_rel, b_src, b_new))
+        self.assertNotIn(tpcds_num, sel_b)
+        self.assertTrue(any(r.startswith("probe_drop:tpcds:s2:") for r in eng.reasons), eng.reasons)
+        self.assertLess(eng.last_probe_cpu_s, 6.0)
+        self.assertIsNone(eng._raw_tpcds_tables)
+
+        # 4) Partial Stage-3 query bitmask s3(k) on sqlglot/expressions/core.py:957 & non-line conservative fallback
+        c_rel = "sqlglot/expressions/core.py"
+        c_src = (base / c_rel).read_text("utf-8")
+        c_target = "        if not table_alias:\n            return []\n"
+        self.assertIn(c_target, c_src)
+        c_new = c_src.replace(
+            c_target,
+            "        if not table_alias:\n            if False:\n                _zz_s3p = 1\n            return []\n",
+            1,
+        )
+        sel_c = eng.select_commit(_make_patch(c_rel, c_src, c_new))
+        self.assertNotIn(tpcds_num, sel_c)
+        self.assertTrue(any(r.startswith("probe_drop:tpcds:s3(31):") for r in eng.reasons), eng.reasons)
+
+        # Non-line (cls_usage on generator.py) keeps _tpcds_non_line = True
+        g_rel = "sqlglot/generator.py"
+        g_src = (base / g_rel).read_text("utf-8")
+        g_pos = g_src.index("class Generator:\n") + len("class Generator:\n")
+        g_new = g_src[:g_pos] + "    _ZZ_V10_CLS = 1\n" + g_src[g_pos:]
+        orig_b = eng.probe_cpu_budget_s
+        eng.probe_cpu_budget_s = 0.0
+        _ = eng.select_commit(_make_patch(g_rel, g_src, g_new))
+        eng.probe_cpu_budget_s = orig_b
+        self.assertTrue(eng._tpcds_non_line)
+
+        # 5) test_generator_memory (#1224) pass & intentional memory-leak detection
+        d_rel = "sqlglot/generators/dune.py"
+        d_src = (base / d_rel).read_text("utf-8")
+        d_ok = d_src.replace("    TRY_SUPPORTED = False\n", "    _ZZ_V10_OK = 1\n    TRY_SUPPORTED = False\n", 1)
+        sel_d_ok = eng.select_commit(_make_patch(d_rel, d_src, d_ok))
+        self.assertNotIn(gm_num, sel_d_ok)
+        self.assertIn("probe_drop:gen_mem", eng.reasons)
+        self.assertLess(eng.last_probe_cpu_s, 2.0)
+
+        d_leak = "_V10_LEAK = []\n" + d_src.replace(
+            "    TRY_SUPPORTED = False\n",
+            "    TRY_SUPPORTED = False\n\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        _V10_LEAK.append([0] * 100)\n",
+            1,
+        )
+        sel_d_leak = eng.select_commit(_make_patch(d_rel, d_src, d_leak))
+        self.assertIn(gm_num, sel_d_leak)
+        self.assertIn("probe_keep:gen_mem", eng.reasons)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
