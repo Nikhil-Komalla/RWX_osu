@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build precomputed static + dynamic baseline maps for sqlglot at pinned commit eb11aec.
 
-Outputs RWX_track/maps/blast_maps.pkl.zlib containing ONLY baseline commit facts:
+Outputs maps/blast_maps.pkl.zlib containing ONLY baseline commit facts:
   - version: 2
   - commit: pinned baseline commit hash
   - test_ids: list[str] (canonical pytest nodeids sorted deterministically)

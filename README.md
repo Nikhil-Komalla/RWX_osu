@@ -1,6 +1,10 @@
-# Blast Radius: Selective Impact Engine, Staged Dynamic Probing & Scientific Workflow Extension Guide
+# ml_triage: Selective Impact Engine, Staged Dynamic Probing & Scientific Workflow Extension Guide
 
-**Blast Radius** is a high-precision, zero-miss **impact analysis, staged dynamic verification, and makespan-optimal worker scheduling engine** built for the RWX Blast Radius benchmark on [`sqlglot`](https://github.com/tobymao/sqlglot) (pinned at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`).
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+**Topics:** `computational-materials` · `dft` · `mlip` · `materials-informatics` · `catalysis` · `photovoltaics` · `battery-materials` · `semiconductors` · `selective-testing` · `blast-radius` · `impact-analysis` · `duckdb` · `workflow-orchestration` · `python` · `sqlglot`
+
+**[`ml_triage`](https://github.com/Nikhil-Komalla/ml_triage)** is a high-precision, zero-miss **impact analysis, staged dynamic verification, and makespan-optimal worker scheduling engine** built and validated on the RWX Blast Radius benchmark for [`sqlglot`](https://github.com/tobymao/sqlglot) (pinned at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`).
 
 Instead of blindly re-running every downstream job whenever an upstream file, parameter, or routine changes, the engine combines:
 
@@ -23,9 +27,9 @@ While the code in [`selector.py`](selector.py) and [`build_maps.py`](build_maps.
   - [2.3 Container Sandbox Constraints & Guardrails](#23-container-sandbox-constraints--guardrails)
   - [2.4 Environment Variables & `build_maps.py` CLI](#24-environment-variables--build_mapspy-cli)
   - [2.5 Verified Performance (`v14-stage3-restore-and-turbo`)](#25-verified-performance-v14-stage3-restore-and-turbo)
-- [3. Adapting Blast Radius to General Data & Scientific Problems](#3-adapting-blast-radius-to-general-data--scientific-problems)
+- [3. Adapting `ml_triage` to General Data & Scientific Problems](#3-adapting-ml_triage-to-general-data--scientific-problems)
 - [4. Extending to Computational Materials Science: DFT + MLIP Workflows](#4-extending-to-computational-materials-science-dft--mlip-workflows)
-  - [4.1 Why Blast Radius Fits High-Throughput Materials Discovery](#41-why-blast-radius-fits-high-throughput-materials-discovery)
+  - [4.1 Why `ml_triage` Fits High-Throughput Materials Discovery](#41-why-ml_triage-fits-high-throughput-materials-discovery)
   - [4.2 The 4-Stage Multi-Fidelity DFT + MLIP Short-Circuit Pipeline](#42-the-4-stage-multi-fidelity-dft--mlip-short-circuit-pipeline)
   - [4.3 Domain Blueprints](#43-domain-blueprints)
     - [Catalysis: Heterogeneous, Electrochemical, and Photocatalysis](#catalysis-heterogeneous-electrochemical-and-photocatalysis)
@@ -38,6 +42,7 @@ While the code in [`selector.py`](selector.py) and [`build_maps.py`](build_maps.
   - [5.3 Multi-Fidelity Calibration & Summary Aggregation (DuckDB + Pandas)](#53-multi-fidelity-calibration--summary-aggregation-duckdb--pandas)
   - [5.4 Illustrative Multi-Domain Screening Summary Report](#54-illustrative-multi-domain-screening-summary-report)
 - [6. Repository Layout, Testing & Troubleshooting](#6-repository-layout-testing--troubleshooting)
+- [7. GitHub Topics & License](#7-github-topics--license)
 
 ---
 
@@ -78,7 +83,10 @@ flowchart TD
 You need **Docker**, **Make**, and **Python 3.9+** (the container uses Python 3.13 via `Dockerfile`).
 
 ```sh
-# 1. Build the docker image (linux/amd64 by default in Makefile)
+# 0. Clone ml_triage
+git clone https://github.com/Nikhil-Komalla/ml_triage.git && cd ml_triage
+
+# 1. Build the docker image (ml_triage, linux/amd64 by default in Makefile)
 make build
 
 # 2. Build, run selector.py inside the sandbox limits on ./sample, and score against sample/answers.json
@@ -178,11 +186,11 @@ Observed results on `main` (`bd18dc2`, merging `v14-stage3-restore-and-turbo`):
 
 ---
 
-## 3. Adapting Blast Radius to General Data & Scientific Problems
+## 3. Adapting `ml_triage` to General Data & Scientific Problems
 
-Strip away `sqlglot`-specific syntax and Blast Radius is a **domain-agnostic incremental verification and compute-scheduling engine**. Any workflow where upstream code, configuration, schema, or parameter perturbations trigger expensive downstream evaluations shares the exact same optimization geometry:
+Strip away `sqlglot`-specific syntax and `ml_triage` is a **domain-agnostic incremental verification and compute-scheduling engine**. Any workflow where upstream code, configuration, schema, or parameter perturbations trigger expensive downstream evaluations shares the exact same optimization geometry:
 
-| Blast Radius Primitive | General Data / ETL / ML / Analytics Equivalent | Computational Physics / Materials Equivalent |
+| `ml_triage` Primitive | General Data / ETL / ML / Analytics Equivalent | Computational Physics / Materials Equivalent |
 | --- | --- | --- |
 | `/data/commits/<id>.patch` | Git PR, SQL/dbt model edit, feature transform diff, hyperparameter config change | Updated crystal structure (POSCAR/CIF), `INCAR`/`KPOINTS`/`POTCAR` change, new MLIP weights, updated reference chemical potential $\mu_i^0$ |
 | `/data/tests.json` (`number`, `seconds`) | Downstream analytics queries, Parquet partitions, ML validation suites + historical runtimes | Downstream property workflows (slab adsorption, NEB barrier, HSE06 bandgap, DFPT phonon, defect cell) + logged node-hours |
@@ -207,7 +215,7 @@ Strip away `sqlglot`-specific syntax and Blast Radius is a **domain-agnostic inc
 > [!NOTE]
 > **Extension Architecture Notice:** Out of the box, [`selector.py`](selector.py) and [`build_maps.py`](build_maps.py) operate on `sqlglot` ASTs, diffs, and test bitmasks. The designs below show **how to extend and adapt these exact primitives**—together with [`Dockerfile`](Dockerfile)'s bundled **`duckdb==2.0.0`, `pandas==3.1.1`, and `numpy==2.5.5`** stack—for computational materials discovery workflows mixing **first-principles DFT** and **MLIPs**.
 
-### 4.1 Why Blast Radius Fits High-Throughput Materials Discovery
+### 4.1 Why `ml_triage` Fits High-Throughput Materials Discovery
 
 Modern catalysis, PV, battery, and semiconductor platforms maintain $10^4$ to $10^6$ DFT/MLIP artifacts (relaxed structures, charge densities, convex hulls, reaction networks, defect supercells, band structures) across `VASP`, `Quantum ESPRESSO`, `CP2K`, `GPAW`, `FHI-aims`, and ASE/pymatgen databases alongside fast neural potentials (`MACE`, `NequIP`, `Allegro`, `CHGNet`, `M3GNet`, `Orb`, `SevenNet`, `EquiformerV2`).
 
@@ -339,7 +347,7 @@ How each stage enforces **zero scientific misses**:
 
 A major bottleneck in materials informatics is **not just running simulations, but turning tens of thousands of heterogeneous DFT outputs (`vasprun.xml`, `OUTCAR`, `pw.out`, ASE `.db` / `.extxyz`) and MLIP inference logs into clean, trustworthy, audit-ready summary tables**.
 
-Because [`Dockerfile`](Dockerfile) already installs **`duckdb==2.0.0`**, **`pandas==3.1.1`**, and **`numpy==2.5.5`**, you can pair Blast Radius's selective job engine directly with an analytical DuckDB summarization layer.
+Because [`Dockerfile`](Dockerfile) already installs **`duckdb==2.0.0`**, **`pandas==3.1.1`**, and **`numpy==2.5.5`**, you can pair `ml_triage`'s selective job engine directly with an analytical DuckDB summarization layer.
 
 ### 5.1 Unified Simulation Record Schema
 
@@ -510,6 +518,7 @@ def summarize_materials_campaign(runs_parquet: str, out_prefix: str) -> None:
 | [`selftests/test_selector_rules.py`](selftests/test_selector_rules.py) | Comprehensive regression tests (`pytest`) for static rules, AST checks, probes, and worker packing. |
 | [`tests_local/`](tests_local/) | Local evaluation & profiling harnesses: [`eval_sample.py`](tests_local/eval_sample.py), [`test_selector.py`](tests_local/test_selector.py), [`oracle_report.py`](tests_local/oracle_report.py), [`probe_bench.py`](tests_local/probe_bench.py). |
 | [`sample/`](sample/) | Local 30-commit sample dataset (`sample/commits/*.patch`, `sample/tests.json`, `sample/answers.json`). |
+| [`LICENSE`](LICENSE) | MIT License for the `ml_triage` repository. |
 
 ### Running the Full Test & Evaluation Suite
 
@@ -535,3 +544,25 @@ make sample
 - **`SKIP_INTEGRATION=0`:** `sqlglot` skips integration/executor tests unless `SKIP_INTEGRATION=0` is set; ground-truth labels were generated with `SKIP_INTEGRATION=0`.
 - **Apple Silicon (`arm64`) vs Scorer (`linux/amd64`):** Always build and benchmark containers with `--platform linux/amd64` (already configured in [`Makefile`](Makefile)) so timings and binary wheels match the evaluation environment.
 - **Matching the ground-truth Python packages:** When generating new baseline maps locally, install from [`requirements.lock`](requirements.lock) rather than `pip install -e .[dev]` so dependency behavior matches the pinned baseline environment.
+
+---
+
+## 7. GitHub Topics & License
+
+### GitHub Repository Topics
+
+To apply the curated discovery topics to [`Nikhil-Komalla/ml_triage`](https://github.com/Nikhil-Komalla/ml_triage) via the GitHub CLI (or paste them into **About → Topics** on GitHub):
+
+```text
+computational-materials, dft, mlip, materials-informatics, catalysis, photovoltaics, battery-materials, semiconductors, selective-testing, blast-radius, impact-analysis, duckdb, workflow-orchestration, python, sqlglot
+```
+
+```sh
+gh repo edit Nikhil-Komalla/ml_triage \
+  --add-topic computational-materials,dft,mlip,materials-informatics,catalysis,photovoltaics,battery-materials,semiconductors,selective-testing,blast-radius,impact-analysis,duckdb,workflow-orchestration,python,sqlglot
+```
+
+### License
+
+Released under the **MIT License** — see [`LICENSE`](LICENSE) for full terms (`Copyright (c) 2026 Nikhil Komalla`).
+

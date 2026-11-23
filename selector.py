@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Blast Radius AST + coverage + dynamic-dependency test selector & optimal worker packer."""
+"""ml_triage: AST + coverage + dynamic-dependency test selector & optimal worker packer."""
 from __future__ import annotations
 
 import ast

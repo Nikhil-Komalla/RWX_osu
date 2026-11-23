@@ -1,4 +1,4 @@
-IMAGE ?= blast-radius-entry
+IMAGE ?= ml_triage
 SAMPLE := $(CURDIR)/sample
 OUTPUT := $(CURDIR)/output.jsonl
 

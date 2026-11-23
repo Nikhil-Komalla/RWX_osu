@@ -1,4 +1,4 @@
-"""Unit and regression tests for v4 Blast Radius selector.py (no sample/answers dependencies)."""
+"""Unit and regression tests for ml_triage selector.py (no sample/answers dependencies)."""
 from __future__ import annotations
 
 import ast
@@ -13,8 +13,8 @@ import zlib
 from pathlib import Path
 from unittest import mock
 
-RWX_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(RWX_DIR))
+REPO_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_DIR))
 
 import build_maps  # noqa: E402
 import score  # noqa: E402
@@ -52,7 +52,7 @@ def _make_mini_engine():
         "rev_imports": {"sqlglot/mod_a.py": ["tests/test_alpha.py"]},
         "dialect_typing_links": {},
     }
-    return selector.SelectorEngine(tests_json, maps, RWX_DIR / "_sqlglot_baseline")
+    return selector.SelectorEngine(tests_json, maps, REPO_DIR / "_sqlglot_baseline")
 
 
 class SelectorUnitTests(unittest.TestCase):
@@ -676,7 +676,7 @@ class SelectorUnitTests(unittest.TestCase):
             "line_cov": {},
             "file_access": {"tests/fixtures/shared.sql": [0, 1]},
         }
-        eng = selector.SelectorEngine(tests_json, maps, RWX_DIR / "_sqlglot_baseline")
+        eng = selector.SelectorEngine(tests_json, maps, REPO_DIR / "_sqlglot_baseline")
         p = (
             "diff --git a/tests/fixtures/shared.sql b/tests/fixtures/shared.sql\n"
             "--- a/tests/fixtures/shared.sql\n"
@@ -1437,12 +1437,12 @@ class SelectorUnitTests(unittest.TestCase):
 
     @staticmethod
     def _make_real_engine():
-        tests_json = json.loads((RWX_DIR / "sample/tests.json").read_text("utf-8"))
-        maps = selector.load_maps(RWX_DIR / "maps/blast_maps.pkl.zlib")
-        return selector.SelectorEngine(tests_json, maps, RWX_DIR / "_sqlglot_baseline")
+        tests_json = json.loads((REPO_DIR / "sample/tests.json").read_text("utf-8"))
+        maps = selector.load_maps(REPO_DIR / "maps/blast_maps.pkl.zlib")
+        return selector.SelectorEngine(tests_json, maps, REPO_DIR / "_sqlglot_baseline")
 
     def test_v8_patch_overlay_finder_isolation(self) -> None:
-        base = RWX_DIR / "_sqlglot_baseline"
+        base = REPO_DIR / "_sqlglot_baseline"
         opt_init = (base / "sqlglot/optimizer/__init__.py").read_text("utf-8")
         finder = selector.PatchOverlayFinder(
             base,
@@ -1492,7 +1492,7 @@ class SelectorUnitTests(unittest.TestCase):
         eng = self._make_real_engine()
         eng.max_s3_exec_qids = 57
         eng._s3_budget_env = 25.0
-        base = RWX_DIR / "_sqlglot_baseline"
+        base = REPO_DIR / "_sqlglot_baseline"
         tpcds_num = eng.tpcds_num
         self.assertIsNotNone(tpcds_num)
 
@@ -1513,13 +1513,13 @@ class SelectorUnitTests(unittest.TestCase):
         self.assertTrue(any(r.startswith("probe_drop:tpcds:") for r in eng.reasons), eng.reasons)
 
         # 2) Sample 2jrq -> fails at q1 -> keeps #1106
-        p_2jrq = (RWX_DIR / "sample/commits/2jrq.patch").read_text("utf-8")
+        p_2jrq = (REPO_DIR / "sample/commits/2jrq.patch").read_text("utf-8")
         sel_2jrq = eng.select_commit(p_2jrq)
         self.assertIn(tpcds_num, sel_2jrq)
         self.assertTrue(any(r.startswith("probe_keep:tpcds:") for r in eng.reasons), eng.reasons)
 
         # 3) Sample 3utz (serde.py) -> pickle round-trip catches KeyError -> keeps #1106
-        p_3utz = (RWX_DIR / "sample/commits/3utz.patch").read_text("utf-8")
+        p_3utz = (REPO_DIR / "sample/commits/3utz.patch").read_text("utf-8")
         sel_3utz = eng.select_commit(p_3utz)
         self.assertIn(tpcds_num, sel_3utz)
         self.assertTrue(any(r.startswith("probe_keep:tpcds:") for r in eng.reasons), eng.reasons)
@@ -1528,7 +1528,7 @@ class SelectorUnitTests(unittest.TestCase):
         import difflib
 
         eng = self._make_real_engine()
-        base = RWX_DIR / "_sqlglot_baseline"
+        base = REPO_DIR / "_sqlglot_baseline"
         mn_num = eng.max_nodes_num
         self.assertIsNotNone(mn_num)
 
@@ -1604,7 +1604,7 @@ class SelectorUnitTests(unittest.TestCase):
 
     def test_v8_probe_budget_and_disable_toggle(self) -> None:
         eng = self._make_real_engine()
-        p_2jrq = (RWX_DIR / "sample/commits/2jrq.patch").read_text("utf-8")
+        p_2jrq = (REPO_DIR / "sample/commits/2jrq.patch").read_text("utf-8")
         selector.TRACE = True
 
         # Budget 0.0 -> skips probing cleanly
@@ -1627,7 +1627,7 @@ class SelectorUnitTests(unittest.TestCase):
         import difflib
 
         eng = self._make_real_engine()
-        base = RWX_DIR / "_sqlglot_baseline"
+        base = REPO_DIR / "_sqlglot_baseline"
         tpcds_num = eng.tpcds_num
         self.assertIsNotNone(tpcds_num)
         self.assertEqual(len(eng.tpcds_parse_digests), 99)
@@ -1688,7 +1688,7 @@ class SelectorUnitTests(unittest.TestCase):
             eng.tpcds_opt_digests[0] = orig_o0
 
         # Sample 3utz (serde.py) -> Stage 1 catches KeyError & keeps #1106
-        p_3utz = (RWX_DIR / "sample/commits/3utz.patch").read_text("utf-8")
+        p_3utz = (REPO_DIR / "sample/commits/3utz.patch").read_text("utf-8")
         sel_3utz = eng.select_commit(p_3utz)
         self.assertIn(tpcds_num, sel_3utz)
         self.assertTrue(any(r.startswith("probe_keep:tpcds:s1:") for r in eng.reasons), eng.reasons)
@@ -1719,7 +1719,7 @@ class SelectorUnitTests(unittest.TestCase):
             eng.tpcds_opt_digests[q_hit] = orig_oq
 
         # Sample 2jrq (eliminate_joins.py) -> Stage 2 detects opt diff, falls through to Stage 3 at q1 & keeps #1106
-        p_2jrq = (RWX_DIR / "sample/commits/2jrq.patch").read_text("utf-8")
+        p_2jrq = (REPO_DIR / "sample/commits/2jrq.patch").read_text("utf-8")
         sel_2jrq = eng.select_commit(p_2jrq)
         self.assertIn(tpcds_num, sel_2jrq)
         self.assertTrue(any(r.startswith("probe_keep:tpcds:s2->s3:") for r in eng.reasons), eng.reasons)
@@ -1728,7 +1728,7 @@ class SelectorUnitTests(unittest.TestCase):
         import difflib
 
         eng = self._make_real_engine()
-        base = RWX_DIR / "_sqlglot_baseline"
+        base = REPO_DIR / "_sqlglot_baseline"
         tpcds_num = eng.tpcds_num
         gm_num = eng.gen_mem_num
         self.assertIsNotNone(tpcds_num)
@@ -1852,18 +1852,18 @@ class SelectorUnitTests(unittest.TestCase):
         import importlib
 
         eng = self._make_real_engine()
-        base = RWX_DIR / "_sqlglot_baseline"
+        base = REPO_DIR / "_sqlglot_baseline"
         selector.TRACE = True
 
         # 1) Passing 0-fail sample commits drop to 0 tests (including TestOptimizer::test_optimize via opt_conn_digests!)
         for cid in ("2qn5", "5y72", "8y7j", "fryt", "ktz3"):
-            patch_txt = (RWX_DIR / f"sample/commits/{cid}.patch").read_text("utf-8")
+            patch_txt = (REPO_DIR / f"sample/commits/{cid}.patch").read_text("utf-8")
             chosen = eng.select_commit(patch_txt)
             self.assertEqual(chosen, set(), f"{cid}: expected empty selection, got {chosen}, reasons={eng.reasons}")
             self.assertTrue(any(r.startswith("probe_drop:fast:") for r in eng.reasons), (cid, eng.reasons))
 
         # 2) Failing partial sample commit 6ze8 keeps the failing test (& fast fail-fast stops importing extra micro-tests)
-        p_6ze8 = (RWX_DIR / "sample/commits/6ze8.patch").read_text("utf-8")
+        p_6ze8 = (REPO_DIR / "sample/commits/6ze8.patch").read_text("utf-8")
         sel_6ze8 = eng.select_commit(p_6ze8)
         regexp_split_num = eng.id_to_num["tests/dialects/test_dremio.py::TestDremio::test_regexp_split"]
         self.assertIn(regexp_split_num, sel_6ze8, eng.reasons)
@@ -1972,7 +1972,7 @@ class SelectorUnitTests(unittest.TestCase):
         eng2.s3_probe_cpu_s = eng2.probe_cpu_budget_s
         eng2.fast_probe_cpu_s = 0.0
         eng2.total_probe_cpu_s = 15.0
-        p_2qn5 = (RWX_DIR / "sample/commits/2qn5.patch").read_text("utf-8")
+        p_2qn5 = (REPO_DIR / "sample/commits/2qn5.patch").read_text("utf-8")
         sel_p1 = eng2.select_commit(p_2qn5)
         self.assertEqual(sel_p1, set(), eng2.reasons)
         self.assertTrue(any(r.startswith("probe_drop:fast:") for r in eng2.reasons), eng2.reasons)
@@ -1981,11 +1981,11 @@ class SelectorUnitTests(unittest.TestCase):
         import difflib
 
         eng = self._make_real_engine()
-        base = RWX_DIR / "_sqlglot_baseline"
+        base = REPO_DIR / "_sqlglot_baseline"
         selector.TRACE = True
 
         # 1) Verify v12 map schema and expanded default cap
-        maps = selector.load_maps(RWX_DIR / "maps/blast_maps.pkl.zlib")
+        maps = selector.load_maps(REPO_DIR / "maps/blast_maps.pkl.zlib")
         self.assertGreaterEqual(int(maps.get("version", 0)), 10)
         self.assertLessEqual(len(maps.get("fast_unprobed_ids", ())), 10)
         self.assertEqual(eng.max_s3_exec_qids, 57)
@@ -2022,7 +2022,7 @@ class SelectorUnitTests(unittest.TestCase):
         self.assertTrue(any(r.startswith("probe_keep:tpcds:s3") for r in eng.reasons), eng.reasons)
 
         # 3) #1295 test_annotate_funcs: drops benign leaf edit and fails fast on sample commit j6uz
-        p_j6uz = (RWX_DIR / "sample/commits/j6uz.patch").read_text("utf-8")
+        p_j6uz = (REPO_DIR / "sample/commits/j6uz.patch").read_text("utf-8")
         sel_j6uz = eng.select_commit(p_j6uz)
         self.assertIn(eng.ann_funcs_num, sel_j6uz, eng.reasons)
         self.assertLess(eng.last_probe_cpu_s, 0.60)
@@ -2047,8 +2047,8 @@ class SelectorUnitTests(unittest.TestCase):
         #    (2qn5) runs BEFORE Stage-3 heavy commit (3utz) even though 3utz appears first in input order!
         eng_roi = self._make_real_engine()
         eng_roi.probe_cpu_budget_s = 3.0
-        p_3utz = (RWX_DIR / "sample/commits/3utz.patch").read_text("utf-8")
-        p_2qn5 = (RWX_DIR / "sample/commits/2qn5.patch").read_text("utf-8")
+        p_3utz = (REPO_DIR / "sample/commits/3utz.patch").read_text("utf-8")
+        p_2qn5 = (REPO_DIR / "sample/commits/2qn5.patch").read_text("utf-8")
         res = eng_roi.select_batch([p_3utz, p_2qn5], scale_budget=False)
         self.assertEqual(len(res), 2)
         self.assertIn(eng_roi.tpcds_num, res[0][0])
@@ -2058,7 +2058,7 @@ class SelectorUnitTests(unittest.TestCase):
         import difflib
 
         eng = self._make_real_engine()
-        base = RWX_DIR / "_sqlglot_baseline"
+        base = REPO_DIR / "_sqlglot_baseline"
         selector.TRACE = True
 
         def _make_patch(rel: str, old_s: str, new_s: str) -> str:
@@ -2119,7 +2119,7 @@ class SelectorUnitTests(unittest.TestCase):
             "probe_drop:tpch",
         ):
             self.assertIn(reason, eng_m.reasons, eng_m.reasons)
-        test_ids = [t["id"] for t in json.loads((RWX_DIR / "sample/tests.json").read_text("utf-8"))["tests"]]
+        test_ids = [t["id"] for t in json.loads((REPO_DIR / "sample/tests.json").read_text("utf-8"))["tests"]]
         dropped_ids = {test_ids[n] for n in (sel_stat - sel_my)}
         kept_ids = {test_ids[n] for n in sel_my}
         for tid in (
@@ -2136,7 +2136,7 @@ class SelectorUnitTests(unittest.TestCase):
 
         eng = self._make_real_engine()
         self.assertEqual(eng.max_s3_exec_qids, 57)
-        base = RWX_DIR / "_sqlglot_baseline"
+        base = REPO_DIR / "_sqlglot_baseline"
         pl_rel = "sqlglot/planner.py"
         pl_src = (base / pl_rel).read_text("utf-8")
 
